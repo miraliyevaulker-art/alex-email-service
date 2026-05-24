@@ -44,7 +44,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-anthropic_client  = Anthropic(api_key=ANTHROPIC_API_KEY)
+anthropic_client   = Anthropic(api_key=ANTHROPIC_API_KEY)
 processed_ids_file = "/tmp/processed_emails.json"
 
 SYSTEM_PROMPT = """You are Alex Rivera — senior Construction Expert at SCOPE Consulting MMC.
@@ -61,46 +61,27 @@ YOUR EXPERTISE:
 - Claims and variations
 - Eurocodes, British Standards, ISO, GOST, AzDTN, SNiP standards
 
-WHO YOU ARE:
-A senior construction professional. Real colleague. Not a robot.
-You adapt to any project, any contractor, any vendor, any discipline.
-
-LANGUAGE RULES — CRITICAL:
-1. English email → respond in English ONLY
-2. Azerbaijani email → respond in Azerbaijani ONLY
+LANGUAGE RULES:
+1. English email → English reply ONLY
+2. Azerbaijani email → Azerbaijani reply ONLY
 3. Mixed → dominant language
 4. NEVER mix languages
 
-AZERBAIJANI QUALITY:
-1. MANDATORY: ə ı ö ü ğ ş ç İ Ə Ö Ü Ğ Ş Ç
-2. NEVER: ə→e, ı→i, ğ→g, ş→s, ç→c
-3. AzDTN/GOST standard terminology
-4. Formal register always
+AZERBAIJANI: ə ı ö ü ğ ş ç — mandatory. AzDTN/GOST terminology. Formal register.
 
 EMAIL REPLY FORMAT:
-- Professional, concise, structured
-- Reference document numbers and clause numbers
-- Clear action items with deadlines
-- End with signature:
+Professional, structured, concise.
+Reference document numbers where relevant.
+Clear action items with deadlines.
 
+Signature:
 Alex Rivera
 Construction Expert | SCOPE Consulting MMC
 internal@scope-iq.io
 
-QA/QC:
-MAR → ✅ APPROVED / ⚠️ APPROVED WITH COMMENTS / ❌ REJECTED
-Azerbaijani → ✅ TƏSDİQLƏNDİ / ⚠️ ŞƏRHLƏ TƏSDİQLƏNDİ / ❌ RƏDD EDİLDİ
-
-BOQ: Every position vs Baku market rates — flag HIGH/LOW/OK
-FIDIC/NEC4: Contractually correct responses always
-
-BAKU MARKET RATES:
-TORPAQ: Mexaniki qazıntı 8-15 AZN/m³, Əl qazıntı 60-90 AZN/m³, Doldurma 8-12 AZN/m³
-BETON: C25/30 190-240 AZN/m³, Armatur 1200-1500 AZN/ton, Qəlib 18-28 AZN/m²
-HÖRGÜ: Kərpic xarici 25-40 AZN/m², Kərpic daxili 20-32 AZN/m², Suvaq 16-24 AZN/m²
-BƏZƏYİŞ: Kafel 25-40 AZN/m², Alçipan 32-48 AZN/m², Armstrong 28-42 AZN/m², Boya 12-18 AZN/m²
-MEP: Hava kanalları 45-75 AZN/m², Fankoyl 350-600 AZN/ədəd, İşıq 45-120 AZN/ədəd, Sprinkler 45-75 AZN/m²
-QAPI: Metal qapı 4500-6500 AZN/ədəd, Alüminium qapı 700-900 AZN/ədəd"""
+QA/QC: MAR → ✅ APPROVED / ⚠️ WITH COMMENTS / ❌ REJECTED
+BOQ: Every position vs Baku market rates
+FIDIC/NEC4: Contractually correct always"""
 
 
 def get_sheet(tab="Sheet1"):
@@ -109,10 +90,10 @@ def get_sheet(tab="Sheet1"):
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive"
         ]
-        google_creds_json = os.environ.get("GOOGLE_CREDENTIALS")
-        if google_creds_json:
+        creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+        if creds_json:
             creds = Credentials.from_service_account_info(
-                json.loads(google_creds_json), scopes=scopes)
+                json.loads(creds_json), scopes=scopes)
         else:
             creds = Credentials.from_service_account_file(
                 GOOGLE_CREDS_FILE, scopes=scopes)
@@ -127,9 +108,11 @@ def save_to_memory(sender, subject, summary, action, status="Open"):
     try:
         sheet = get_sheet("Sheet1")
         if sheet:
-            date = datetime.now().strftime("%d.%m.%Y %H:%M")
-            sheet.append_row([date, sender, subject, summary, action, status])
-            logger.info(f"Saved: {subject}")
+            sheet.append_row([
+                datetime.now().strftime("%d.%m.%Y %H:%M"),
+                sender, subject, summary, action, status
+            ])
+            logger.info(f"Saved to memory: {subject}")
     except Exception as e:
         logger.error(f"Save error: {e}")
 
@@ -153,9 +136,9 @@ def load_processed_ids():
         if os.path.exists(processed_ids_file):
             with open(processed_ids_file) as f:
                 return set(json.load(f))
-        return set()
     except:
-        return set()
+        pass
+    return set()
 
 
 def save_processed_id(msg_id):
@@ -168,89 +151,97 @@ def save_processed_id(msg_id):
         logger.error(f"Save ID error: {e}")
 
 
-def decode_str(s):
-    if not s:
-        return ""
+def safe_decode(value, fallback=""):
+    """Safely decode email header value"""
+    if value is None:
+        return fallback
     try:
-        decoded = decode_header(s)
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        parts = decode_header(str(value))
         result = ""
-        for part, enc in decoded:
+        for part, enc in parts:
             if isinstance(part, bytes):
                 result += part.decode(enc or "utf-8", errors="replace")
             else:
                 result += str(part)
         return result
     except:
-        return str(s)
+        return str(value) if value else fallback
 
 
 def get_email_body(msg):
+    """Extract plain text body from email"""
     body = ""
     try:
         if msg.is_multipart():
             for part in msg.walk():
-                if part.get_content_type() == "text/plain":
-                    try:
+                try:
+                    if part.get_content_type() == "text/plain":
                         payload = part.get_payload(decode=True)
                         if payload:
-                            body += payload.decode("utf-8", errors="replace")
-                    except:
-                        pass
+                            body += payload.decode(
+                                part.get_content_charset() or "utf-8",
+                                errors="replace"
+                            )
+                except:
+                    continue
         else:
             payload = msg.get_payload(decode=True)
             if payload:
-                body = payload.decode("utf-8", errors="replace")
+                charset = msg.get_content_charset() or "utf-8"
+                body = payload.decode(charset, errors="replace")
     except Exception as e:
-        logger.error(f"Get body error: {e}")
+        logger.error(f"Body extraction error: {e}")
     return body[:3000]
 
 
 def send_reply(to_email, subject, body, reply_to_msg_id=None):
+    """Send email via SMTP"""
     try:
         msg = MIMEMultipart()
         msg["From"]    = ZOHO_EMAIL
         msg["To"]      = to_email
         msg["Subject"] = subject
         if reply_to_msg_id:
-            msg["In-Reply-To"] = reply_to_msg_id
-            msg["References"]  = reply_to_msg_id
+            msg["In-Reply-To"] = str(reply_to_msg_id)
+            msg["References"]  = str(reply_to_msg_id)
         msg.attach(MIMEText(body, "plain", "utf-8"))
 
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
             server.login(ZOHO_EMAIL, ZOHO_APP_PASSWORD)
             server.send_message(msg)
-            logger.info(f"Reply sent to {to_email} ✅")
+            logger.info(f"✅ Reply sent to {to_email}")
             return True
     except Exception as e:
-        logger.error(f"Send reply error: {e}")
+        logger.error(f"SMTP error: {e}")
         return False
 
 
-def analyse_email_content(sender, subject, body, is_cc=False):
+def analyse_email(sender, subject, body, is_cc=False):
+    """Analyse email with Claude"""
     try:
         if is_cc:
-            prompt = f"""You have been CC'd on this email. Analyse for internal SCOPE Consulting purposes ONLY.
-Do NOT write a reply. Internal analysis only.
+            prompt = f"""CC'd email — internal analysis only. Do NOT write a reply.
 
 From: {sender}
 Subject: {subject}
 Content: {body}
 
 Provide:
-1. Email type (MAR/RFI/BOQ/Variation/Claim/NCR/General)
-2. Key points — 2-3 lines
-3. Action required from SCOPE team
-4. Risk level: High/Medium/Low
-5. Recommended response deadline"""
+1. Type: MAR/RFI/BOQ/Variation/Claim/NCR/General
+2. Key points (2-3 lines)
+3. Action needed from SCOPE team
+4. Risk: High/Medium/Low
+5. Response deadline"""
         else:
-            prompt = f"""You received this email directly from a SCOPE Consulting team member.
-Write a complete professional reply.
+            prompt = f"""Email from SCOPE team member — write professional reply.
 
 From: {sender}
 Subject: {subject}
 Content: {body}
 
-Write full professional email reply. Match the language exactly."""
+Write complete professional reply. Match language exactly."""
 
         response = anthropic_client.messages.create(
             model=MODEL,
@@ -269,108 +260,125 @@ def process_emails():
     processed_ids = load_processed_ids()
 
     try:
+        # Connect to IMAP
         mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
         mail.login(ZOHO_EMAIL, ZOHO_APP_PASSWORD)
-        logger.info("IMAP login successful ✅")
+        logger.info("✅ IMAP login successful")
         mail.select("INBOX")
 
-        status, messages = mail.search(None, "ALL")
-
-        if status != "OK":
+        # Search all emails
+        typ, data = mail.search(None, "ALL")
+        if typ != "OK":
             logger.error("Search failed")
             mail.logout()
             return
 
-        if not messages or not messages[0]:
+        # Handle empty inbox
+        if not data or not data[0]:
             logger.info("Inbox empty")
             mail.logout()
             return
 
-        raw_ids = messages[0]
-        if not raw_ids:
-            logger.info("No emails")
+        all_ids = data[0].split()
+        if not all_ids:
+            logger.info("No emails found")
             mail.logout()
             return
 
-        email_ids = raw_ids.split()
-        if not email_ids:
-            logger.info("No email IDs")
-            mail.logout()
-            return
-
-        recent_ids = email_ids[-20:] if len(email_ids) > 20 else email_ids
-        logger.info(f"Found {len(recent_ids)} emails to check")
-
+        # Process last 25 emails
+        recent = all_ids[-25:]
+        logger.info(f"Checking {len(recent)} recent emails")
         new_count = 0
-        for eid in reversed(recent_ids):
+
+        for eid in reversed(recent):
             try:
-                msg_id_str = eid.decode() if isinstance(eid, bytes) else str(eid)
+                eid_str = eid.decode() if isinstance(eid, bytes) else str(eid)
 
-                if msg_id_str in processed_ids:
+                # Skip already processed
+                if eid_str in processed_ids:
                     continue
 
-                status, msg_data = mail.fetch(eid, "(RFC822)")
-                if status != "OK" or not msg_data or not msg_data[0]:
+                # Fetch email
+                typ, msg_data = mail.fetch(eid, "(RFC822)")
+                if typ != "OK" or not msg_data or not msg_data[0]:
+                    save_processed_id(eid_str)
                     continue
 
-                raw_email = msg_data[0][1]
-                if not raw_email:
+                raw = msg_data[0][1]
+                if not raw:
+                    save_processed_id(eid_str)
                     continue
 
-                msg = email.message_from_bytes(raw_email)
+                msg = email.message_from_bytes(raw)
 
-                sender     = decode_str(msg.get("From", "")).lower()
-                subject    = decode_str(msg.get("Subject", "No subject"))
-                to_field   = decode_str(msg.get("To", "")).lower()
-                cc_field   = decode_str(msg.get("CC", "")).lower()
-                msg_id_hdr = msg.get("Message-ID", "")
+                # Extract headers safely
+                sender   = safe_decode(msg.get("From"),    "").lower()
+                subject  = safe_decode(msg.get("Subject"), "No subject")
+                to_field = safe_decode(msg.get("To"),      "").lower()
+                cc_field = safe_decode(msg.get("CC"),      "").lower()
+                msg_hdr  = safe_decode(msg.get("Message-ID"), "")
 
-                # Skip emails sent by Alex
+                # Skip Alex's own sent emails
                 if ZOHO_EMAIL.lower() in sender:
-                    save_processed_id(msg_id_str)
+                    save_processed_id(eid_str)
                     continue
 
                 is_direct   = ZOHO_EMAIL.lower() in to_field
-                is_cc       = ZOHO_EMAIL.lower() in cc_field
+                is_cc_email = ZOHO_EMAIL.lower() in cc_field
                 is_internal = any(t in sender for t in SCOPE_TEAM_EMAILS)
 
-                if not is_direct and not is_cc:
-                    save_processed_id(msg_id_str)
+                # Skip if not relevant
+                if not is_direct and not is_cc_email:
+                    save_processed_id(eid_str)
                     continue
 
                 new_count += 1
                 body = get_email_body(msg)
+                logger.info(f"Processing: {sender} | {subject}")
 
                 if is_direct and is_internal:
-                    logger.info(f"Direct internal: {sender} | {subject}")
-                    analysis = analyse_email_content(sender, subject, body, is_cc=False)
+                    # Internal SCOPE team → reply
+                    analysis = analyse_email(sender, subject, body, is_cc=False)
                     if analysis:
                         reply_sub = f"Re: {subject}" if not subject.startswith("Re:") else subject
-                        sent = send_reply(sender, reply_sub, analysis, msg_id_hdr)
-                        save_to_memory(sender, subject, analysis[:300], "Replied by Alex", "Closed" if sent else "Open")
+                        sent = send_reply(sender, reply_sub, analysis, msg_hdr)
+                        save_to_memory(
+                            sender, subject, analysis[:300],
+                            "Replied by Alex",
+                            "Closed" if sent else "Open"
+                        )
 
                 elif is_direct and not is_internal:
-                    logger.info(f"Ignoring external: {sender}")
+                    # External direct → ignore
+                    logger.info(f"Ignoring external direct: {sender}")
 
-                elif is_cc:
-                    logger.info(f"CC'd: {sender} | {subject}")
-                    analysis = analyse_email_content(sender, subject, body, is_cc=True)
+                elif is_cc_email:
+                    # CC'd → silent log
+                    analysis = analyse_email(sender, subject, body, is_cc=True)
                     if analysis:
-                        save_to_memory(sender, subject, analysis[:300], "Logged — action required", "Monitoring")
+                        save_to_memory(
+                            sender, subject, analysis[:300],
+                            "Logged — action required",
+                            "Monitoring"
+                        )
 
-                save_processed_id(msg_id_str)
+                save_processed_id(eid_str)
 
             except Exception as e:
-                logger.error(f"Email process error: {e}")
+                logger.error(f"Email error: {e}")
+                try:
+                    save_processed_id(eid_str)
+                except:
+                    pass
                 continue
 
         mail.logout()
-        logger.info(f"Done — {new_count} new emails processed")
+        logger.info(f"✅ Done — {new_count} new emails processed")
 
     except imaplib.IMAP4.error as e:
         logger.error(f"IMAP auth error: {e}")
     except Exception as e:
-        logger.error(f"IMAP error: {e}")
+        logger.error(f"IMAP connection error: {e}")
 
 
 def send_morning_report():
@@ -391,41 +399,55 @@ def send_morning_report():
 
         report  = f"SCOPE IQ — Günlük E-poçt Hesabatı\n"
         report += f"{day_az}, {today}\n"
-        report += f"{'='*45}\n\n"
+        report += "=" * 45 + "\n\n"
 
         if pending:
             report += f"CAVAB GÖZLƏYƏN / MONİTORİNQ: {len(pending)}\n\n"
             for r in pending[-15:]:
-                report += f"— {r.get('Subject', r.get('Topic','?'))}\n"
-                report += f"  Göndərən: {r.get('Sender', r.get('Project','?'))} | {r.get('Date','')} | {r.get('Status','')}\n"
-                report += f"  Tədbirlər: {r.get('Action','')}\n\n"
+                subj   = r.get("Subject") or r.get("Topic") or "?"
+                sender = r.get("Sender") or r.get("Project") or "?"
+                date   = r.get("Date") or ""
+                status = r.get("Status") or ""
+                action = r.get("Action") or ""
+                report += f"— {subj}\n"
+                report += f"  {sender} | {date} | {status}\n"
+                report += f"  {action}\n\n"
         else:
             report += "Gözləyən e-poçt yoxdur. ✅\n\n"
 
-        report += f"{'='*45}\n"
-        report += f"Alex Rivera\n"
-        report += f"Construction Expert | SCOPE Consulting MMC\n"
-        report += f"internal@scope-iq.io"
+        report += "=" * 45 + "\n"
+        report += "Alex Rivera\n"
+        report += "Construction Expert | SCOPE Consulting MMC\n"
+        report += "internal@scope-iq.io"
 
         for recipient in REPORT_RECIPIENTS:
-            send_reply(recipient, f"SCOPE IQ — Günlük Hesabat — {today}", report)
-
-        logger.info("Morning report sent ✅")
+            send_reply(
+                recipient,
+                f"SCOPE IQ — Günlük Hesabat — {today}",
+                report
+            )
+        logger.info("✅ Morning report sent")
 
     except Exception as e:
         logger.error(f"Morning report error: {e}")
 
 
 def main():
+    logger.info("=" * 50)
     logger.info("Alex Email Service starting...")
-    logger.info(f"Monitoring: {ZOHO_EMAIL}")
+    logger.info(f"Email: {ZOHO_EMAIL}")
     logger.info(f"IMAP: {IMAP_HOST}:{IMAP_PORT}")
-    logger.info(f"Authorised team: {SCOPE_TEAM_EMAILS}")
-    logger.info(f"Report recipients: {REPORT_RECIPIENTS}")
+    logger.info(f"Team: {SCOPE_TEAM_EMAILS}")
+    logger.info(f"Reports to: {REPORT_RECIPIENTS}")
+    logger.info("=" * 50)
 
+    # Check every 5 minutes
     schedule.every(5).minutes.do(process_emails)
+
+    # Morning report 9:00 AM Baku = 05:00 UTC
     schedule.every().day.at("05:00").do(send_morning_report)
 
+    # Run immediately on start
     process_emails()
 
     while True:
