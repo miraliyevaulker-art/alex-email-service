@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 token_file = "/tmp/zoho_tokens.json"
+processed_ids_file = "/tmp/processed_emails.json"
 
 SYSTEM_PROMPT = """You are Alex Rivera — senior Construction Expert at SCOPE Consulting MMC.
 
@@ -52,7 +53,7 @@ YOUR EXPERTISE:
 - Materials and specifications
 - Handover and commissioning
 - Claims and variations
-- Eurocodes, British Standards, ISO, GOST, AzDTN, SNiP, SP standards
+- Eurocodes, British Standards, ISO, GOST, AzDTN, SNiP standards
 
 WHO YOU ARE:
 A senior construction professional. Real colleague. Not a robot.
@@ -69,7 +70,6 @@ AZERBAIJANI QUALITY:
 2. NEVER: ə→e, ı→i, ğ→g, ş→s, ç→c
 3. AzDTN/GOST standard terminology
 4. Formal register always
-5. NEVER use: "rəvayət", "problem", "okay", "hata"
 
 EMAIL REPLY FORMAT:
 - Professional, concise, structured
@@ -81,11 +81,11 @@ Alex Rivera
 Construction Expert | SCOPE Consulting MMC
 internal@scope-iq.io
 
-QA/QC RESPONSES:
+QA/QC:
 MAR → ✅ APPROVED / ⚠️ APPROVED WITH COMMENTS / ❌ REJECTED
 Azerbaijani → ✅ TƏSDİQLƏNDİ / ⚠️ ŞƏRHLƏ TƏSDİQLƏNDİ / ❌ RƏDD EDİLDİ
 
-BOQ: Every position vs Baku market rates — flag HIGH/LOW/OK
+BOQ: Every position vs Baku market rates
 FIDIC/NEC4: Contractually correct responses always
 
 BAKU MARKET RATES:
@@ -134,12 +134,34 @@ def read_memory_for_report():
         if sheet:
             records = sheet.get_all_records()
             pending = [r for r in records if r.get("Status") in ["Open", "Monitoring"]]
-            closed = [r for r in records if r.get("Status") == "Closed"]
+            closed  = [r for r in records if r.get("Status") == "Closed"]
             return pending, closed
         return [], []
     except Exception as e:
         logger.error(f"Read memory error: {e}")
         return [], []
+
+
+def load_processed_ids():
+    try:
+        if os.path.exists(processed_ids_file):
+            with open(processed_ids_file) as f:
+                return set(json.load(f))
+        return set()
+    except:
+        return set()
+
+
+def save_processed_id(message_id):
+    try:
+        ids = load_processed_ids()
+        ids.add(str(message_id))
+        # Keep only last 500 IDs
+        ids_list = list(ids)[-500:]
+        with open(processed_ids_file, "w") as f:
+            json.dump(ids_list, f)
+    except Exception as e:
+        logger.error(f"Save processed ID error: {e}")
 
 
 def get_tokens():
@@ -207,6 +229,7 @@ def refresh_access_token(refresh_token):
             }
             with open(token_file, "w") as f:
                 json.dump(tokens, f)
+            logger.info("Access token refreshed")
             return data["access_token"]
         return None
     except Exception as e:
@@ -223,22 +246,27 @@ def get_account_id(access_token):
         data = response.json()
         accounts = data.get("data", [])
         if accounts:
-            return accounts[0].get("accountId")
+            account_id = accounts[0].get("accountId")
+            logger.info(f"Account ID: {account_id}")
+            return account_id
         return None
     except Exception as e:
         logger.error(f"Account ID error: {e}")
         return None
 
 
-def fetch_unread_emails(access_token, account_id):
+def fetch_emails(access_token, account_id):
+    """Fetch recent emails — all, not just unread"""
     try:
         response = requests.get(
             f"https://mail.zoho.com/api/accounts/{account_id}/messages/view",
             headers={"Authorization": f"Zoho-oauthtoken {access_token}"},
-            params={"limit": 20, "start": 0, "status": "unread"}
+            params={"limit": 25, "start": 0, "sortorder": "false"}
         )
         data = response.json()
-        return data.get("data", [])
+        emails = data.get("data", [])
+        logger.info(f"Fetched {len(emails)} emails")
+        return emails
     except Exception as e:
         logger.error(f"Fetch emails error: {e}")
         return []
@@ -255,20 +283,6 @@ def get_email_content(access_token, account_id, message_id):
     except Exception as e:
         logger.error(f"Get email content error: {e}")
         return ""
-
-
-def mark_as_read(access_token, account_id, message_id):
-    try:
-        requests.put(
-            f"https://mail.zoho.com/api/accounts/{account_id}/updatemessage",
-            headers={
-                "Authorization": f"Zoho-oauthtoken {access_token}",
-                "Content-Type": "application/json"
-            },
-            json={"mode": "markAsRead", "messageId": [message_id]}
-        )
-    except Exception as e:
-        logger.error(f"Mark read error: {e}")
 
 
 def send_email(access_token, account_id, to_email, subject, body, reply_to_id=None):
@@ -292,10 +306,10 @@ def send_email(access_token, account_id, to_email, subject, body, reply_to_id=No
             json=payload
         )
         if response.status_code == 200:
-            logger.info(f"Email sent to {to_email}")
+            logger.info(f"Email sent to {to_email} ✅")
             return True
         else:
-            logger.error(f"Send email failed: {response.json()}")
+            logger.error(f"Send failed: {response.status_code} — {response.text}")
             return False
     except Exception as e:
         logger.error(f"Send email error: {e}")
@@ -306,7 +320,7 @@ def analyse_email_content(sender, subject, body, is_cc=False):
     try:
         if is_cc:
             prompt = f"""You have been CC'd on this email. Analyse for internal SCOPE Consulting purposes ONLY.
-Do NOT write a reply. Provide internal analysis only.
+Do NOT write a reply. Internal analysis only.
 
 From: {sender}
 Subject: {subject}
@@ -314,25 +328,19 @@ Content: {body[:3000]}
 
 Provide:
 1. Email type (MAR/RFI/BOQ/Variation/Claim/NCR/General)
-2. Key points — 2-3 lines maximum
+2. Key points — 2-3 lines
 3. Action required from SCOPE team
 4. Risk level: High/Medium/Low
 5. Recommended response deadline"""
-
         else:
             prompt = f"""You received this email directly from a SCOPE Consulting team member.
-Write a complete professional reply email.
+Write a complete professional reply.
 
 From: {sender}
 Subject: {subject}
 Content: {body[:3000]}
 
-Requirements:
-- Match the language of the email exactly
-- Professional structured format
-- Reference document numbers and clause numbers where relevant
-- Clear action items with deadlines
-- End with your signature"""
+Write full professional email reply. Match the language exactly."""
 
         response = anthropic_client.messages.create(
             model=MODEL,
@@ -348,38 +356,50 @@ Requirements:
 
 def process_emails():
     logger.info("Checking emails...")
+    processed_ids = load_processed_ids()
+
     access_token = get_tokens()
     if not access_token:
-        logger.error("No access token")
+        logger.error("No access token — skipping")
         return
 
     account_id = get_account_id(access_token)
     if not account_id:
-        logger.error("No account ID")
+        logger.error("No account ID — skipping")
         return
 
-    emails = fetch_unread_emails(access_token, account_id)
-    logger.info(f"Found {len(emails)} unread emails")
+    emails = fetch_emails(access_token, account_id)
 
+    new_count = 0
     for email in emails:
         try:
+            message_id   = str(email.get("messageId", ""))
             sender       = email.get("sender", "").lower()
             subject      = email.get("subject", "No subject")
-            message_id   = email.get("messageId")
             to_addresses = email.get("toAddress", "").lower()
             cc_addresses = email.get("ccAddress", "").lower()
+
+            # Skip already processed
+            if message_id in processed_ids:
+                continue
+
+            # Skip emails sent FROM Alex himself
+            if ZOHO_EMAIL.lower() in sender:
+                save_processed_id(message_id)
+                continue
 
             is_direct   = ZOHO_EMAIL.lower() in to_addresses
             is_cc       = ZOHO_EMAIL.lower() in cc_addresses
             is_internal = any(team_email in sender for team_email in SCOPE_TEAM_EMAILS)
 
             if not is_direct and not is_cc:
+                save_processed_id(message_id)
                 continue
 
+            new_count += 1
             body = get_email_content(access_token, account_id, message_id)
 
             if is_direct and is_internal:
-                # Internal SCOPE team → analyse and reply
                 logger.info(f"Direct internal: {sender} | {subject}")
                 analysis = analyse_email_content(sender, subject, body, is_cc=False)
                 if analysis:
@@ -389,30 +409,27 @@ def process_emails():
                     save_to_memory(sender, subject, analysis[:300], "Replied by Alex", status)
 
             elif is_direct and not is_internal:
-                # External direct → ignore completely
                 logger.info(f"Ignoring external direct: {sender}")
-                mark_as_read(access_token, account_id, message_id)
-                continue
 
             elif is_cc:
-                # CC'd → silent analysis and log
                 logger.info(f"CC'd email: {sender} | {subject}")
                 analysis = analyse_email_content(sender, subject, body, is_cc=True)
                 if analysis:
                     save_to_memory(sender, subject, analysis[:300], "Logged — action required", "Monitoring")
 
-            mark_as_read(access_token, account_id, message_id)
+            save_processed_id(message_id)
 
         except Exception as e:
             logger.error(f"Process email error: {e}")
             continue
+
+    logger.info(f"Processed {new_count} new emails")
 
 
 def send_morning_report():
     logger.info("Sending morning report...")
     try:
         pending, closed = read_memory_for_report()
-
         today    = datetime.now().strftime("%d.%m.%Y")
         day_name = datetime.now().strftime("%A")
         day_az   = {
@@ -432,18 +449,12 @@ def send_morning_report():
         if pending:
             report += f"CAVAB GÖZLƏYƏN / MONİTORİNQ: {len(pending)}\n\n"
             for r in pending[-15:]:
-                date    = r.get('Date', '')
-                sender  = r.get('Sender', r.get('Project', '?'))
-                subject = r.get('Subject', r.get('Topic', '?'))
-                action  = r.get('Action', '')
-                status  = r.get('Status', '')
-                report += f"— {subject}\n"
-                report += f"  Göndərən: {sender} | {date} | {status}\n"
-                report += f"  Tədbirlər: {action}\n\n"
+                report += f"— {r.get('Subject', r.get('Topic','?'))}\n"
+                report += f"  Göndərən: {r.get('Sender', r.get('Project','?'))} | {r.get('Date','')} | {r.get('Status','')}\n"
+                report += f"  Tədbirlər: {r.get('Action','')}\n\n"
         else:
             report += "Gözləyən e-poçt yoxdur. ✅\n\n"
 
-        report += f"TAMAMLANANLAR (son 24 saat): {len([r for r in closed if r.get('Date','').startswith(today[:5])])}\n\n"
         report += f"{'='*45}\n"
         report += f"Alex Rivera\n"
         report += f"Construction Expert | SCOPE Consulting MMC\n"
@@ -455,13 +466,11 @@ def send_morning_report():
             if account_id:
                 for recipient in REPORT_RECIPIENTS:
                     send_email(
-                        access_token,
-                        account_id,
-                        recipient,
+                        access_token, account_id, recipient,
                         f"SCOPE IQ — Günlük Hesabat — {today}",
                         report
                     )
-                logger.info(f"Morning report sent to {len(REPORT_RECIPIENTS)} recipients")
+                logger.info(f"Morning report sent to {len(REPORT_RECIPIENTS)} recipients ✅")
 
     except Exception as e:
         logger.error(f"Morning report error: {e}")
@@ -476,7 +485,7 @@ def main():
     # Check emails every 5 minutes
     schedule.every(5).minutes.do(process_emails)
 
-    # Morning report at 9:00 AM Baku time (UTC+4 = 05:00 UTC)
+    # Morning report 9:00 AM Baku (UTC+4 = 05:00 UTC)
     schedule.every().day.at("05:00").do(send_morning_report)
 
     # Run immediately on start
