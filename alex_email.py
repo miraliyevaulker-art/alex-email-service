@@ -15,7 +15,7 @@ ZOHO_CLIENT_SECRET  = os.environ.get("ZOHO_CLIENT_SECRET")
 ZOHO_AUTH_CODE      = os.environ.get("ZOHO_AUTH_CODE")
 ZOHO_EMAIL          = os.environ.get("ZOHO_EMAIL", "internal@scope-iq.io")
 ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY")
-GOOGLE_SHEET_ID     = "1_4L63VqFN6etwLRWW2zT0WyJTHUT8LLTWwqiNPJJR4w"
+GOOGLE_SHEET_ID     = "1i-DZghVlJdLdWUB4jDjCWU_5-1VSzHwgpjZiVUz0-fg"
 GOOGLE_CREDS_FILE   = "primordial-mile-495807-k9-0217981265dd.json"
 MODEL               = "claude-haiku-4-5-20251001"
 
@@ -38,8 +38,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
-
-# Token storage
 token_file = "/tmp/zoho_tokens.json"
 
 SYSTEM_PROMPT = """You are Alex Rivera — senior Construction Expert at SCOPE Consulting MMC.
@@ -54,27 +52,49 @@ YOUR EXPERTISE:
 - Materials and specifications
 - Handover and commissioning
 - Claims and variations
+- Eurocodes, British Standards, ISO, GOST, AzDTN, SNiP, SP standards
 
-LANGUAGE RULES:
+WHO YOU ARE:
+A senior construction professional. Real colleague. Not a robot.
+You adapt to any project, any contractor, any vendor, any discipline.
+
+LANGUAGE RULES — CRITICAL:
 1. English email → respond in English ONLY
 2. Azerbaijani email → respond in Azerbaijani ONLY
 3. Mixed → dominant language
 4. NEVER mix languages
 
+AZERBAIJANI QUALITY:
+1. MANDATORY: ə ı ö ü ğ ş ç İ Ə Ö Ü Ğ Ş Ç
+2. NEVER: ə→e, ı→i, ğ→g, ş→s, ç→c
+3. AzDTN/GOST standard terminology
+4. Formal register always
+5. NEVER use: "rəvayət", "problem", "okay", "hata"
+
 EMAIL REPLY FORMAT:
 - Professional, concise, structured
-- Reference document numbers, clause numbers where relevant
-- Clear action items
-- Signature: Alex Rivera | Construction Expert | SCOPE Consulting MMC | internal@scope-iq.io
+- Reference document numbers and clause numbers
+- Clear action items with deadlines
+- End with signature:
 
-AZERBAIJANI QUALITY:
-- MANDATORY: ə ı ö ü ğ ş ç İ Ə Ö Ü Ğ Ş Ç
-- AzDTN/GOST standard terminology
-- Formal register always
+Alex Rivera
+Construction Expert | SCOPE Consulting MMC
+internal@scope-iq.io
 
-QA/QC: MAR → ✅ TƏSDİQLƏNDİ / ⚠️ ŞƏRHLƏ / ❌ RƏDD EDİLDİ
-BOQ: Every position vs Baku market rates
-FIDIC/NEC4: Contractually correct responses always"""
+QA/QC RESPONSES:
+MAR → ✅ APPROVED / ⚠️ APPROVED WITH COMMENTS / ❌ REJECTED
+Azerbaijani → ✅ TƏSDİQLƏNDİ / ⚠️ ŞƏRHLƏ TƏSDİQLƏNDİ / ❌ RƏDD EDİLDİ
+
+BOQ: Every position vs Baku market rates — flag HIGH/LOW/OK
+FIDIC/NEC4: Contractually correct responses always
+
+BAKU MARKET RATES:
+TORPAQ: Mexaniki qazıntı 8-15 AZN/m³, Əl qazıntı 60-90 AZN/m³, Doldurma 8-12 AZN/m³
+BETON: C25/30 190-240 AZN/m³, Armatur 1200-1500 AZN/ton, Qəlib 18-28 AZN/m²
+HÖRGÜ: Kərpic xarici 25-40 AZN/m², Kərpic daxili 20-32 AZN/m², Suvaq 16-24 AZN/m²
+BƏZƏYİŞ: Kafel 25-40 AZN/m², Alçipan 32-48 AZN/m², Armstrong 28-42 AZN/m², Boya 12-18 AZN/m²
+MEP: Hava kanalları 45-75 AZN/m², Fankoyl 350-600 AZN/ədəd, İşıq 45-120 AZN/ədəd, Sprinkler 45-75 AZN/m²
+QAPI: Metal qapı 4500-6500 AZN/ədəd, Alüminium qapı 700-900 AZN/ədəd"""
 
 
 def get_sheet(tab="Sheet1"):
@@ -97,40 +117,46 @@ def get_sheet(tab="Sheet1"):
         return None
 
 
-def save_email_log(sender, subject, summary, action, status="Open"):
+def save_to_memory(sender, subject, summary, action, status="Open"):
     try:
-        sheet = get_sheet("Email Log")
+        sheet = get_sheet("Sheet1")
         if sheet:
-            sheet.append_row([
-                datetime.now().strftime("%d.%m.%Y %H:%M"),
-                sender, subject, summary, action, status
-            ])
+            date = datetime.now().strftime("%d.%m.%Y %H:%M")
+            sheet.append_row([date, sender, subject, summary, action, status])
+            logger.info(f"Saved to memory: {subject}")
     except Exception as e:
-        logger.error(f"Email log error: {e}")
+        logger.error(f"Save memory error: {e}")
+
+
+def read_memory_for_report():
+    try:
+        sheet = get_sheet("Sheet1")
+        if sheet:
+            records = sheet.get_all_records()
+            pending = [r for r in records if r.get("Status") in ["Open", "Monitoring"]]
+            closed = [r for r in records if r.get("Status") == "Closed"]
+            return pending, closed
+        return [], []
+    except Exception as e:
+        logger.error(f"Read memory error: {e}")
+        return [], []
 
 
 def get_tokens():
-    """Get or refresh Zoho tokens"""
-    # Try to load saved tokens
     if os.path.exists(token_file):
         try:
             with open(token_file) as f:
                 tokens = json.load(f)
-            # Check if access token still valid
             if tokens.get("expires_at", 0) > time.time() + 60:
                 return tokens.get("access_token")
-            # Refresh using refresh token
             if tokens.get("refresh_token"):
                 return refresh_access_token(tokens["refresh_token"])
         except:
             pass
-
-    # First time — exchange auth code for tokens
     return exchange_auth_code()
 
 
 def exchange_auth_code():
-    """Exchange auth code for access + refresh tokens"""
     try:
         response = requests.post(
             "https://accounts.zoho.com/oauth/v2/token",
@@ -162,7 +188,6 @@ def exchange_auth_code():
 
 
 def refresh_access_token(refresh_token):
-    """Refresh expired access token"""
     try:
         response = requests.post(
             "https://accounts.zoho.com/oauth/v2/token",
@@ -190,7 +215,6 @@ def refresh_access_token(refresh_token):
 
 
 def get_account_id(access_token):
-    """Get Zoho Mail account ID"""
     try:
         response = requests.get(
             "https://mail.zoho.com/api/accounts",
@@ -207,7 +231,6 @@ def get_account_id(access_token):
 
 
 def fetch_unread_emails(access_token, account_id):
-    """Fetch unread emails"""
     try:
         response = requests.get(
             f"https://mail.zoho.com/api/accounts/{account_id}/messages/view",
@@ -222,7 +245,6 @@ def fetch_unread_emails(access_token, account_id):
 
 
 def get_email_content(access_token, account_id, message_id):
-    """Get full email content"""
     try:
         response = requests.get(
             f"https://mail.zoho.com/api/accounts/{account_id}/messages/{message_id}/content",
@@ -236,7 +258,6 @@ def get_email_content(access_token, account_id, message_id):
 
 
 def mark_as_read(access_token, account_id, message_id):
-    """Mark email as read"""
     try:
         requests.put(
             f"https://mail.zoho.com/api/accounts/{account_id}/updatemessage",
@@ -244,17 +265,13 @@ def mark_as_read(access_token, account_id, message_id):
                 "Authorization": f"Zoho-oauthtoken {access_token}",
                 "Content-Type": "application/json"
             },
-            json={
-                "mode": "markAsRead",
-                "messageId": [message_id]
-            }
+            json={"mode": "markAsRead", "messageId": [message_id]}
         )
     except Exception as e:
         logger.error(f"Mark read error: {e}")
 
 
 def send_email(access_token, account_id, to_email, subject, body, reply_to_id=None):
-    """Send email via Zoho"""
     try:
         payload = {
             "fromAddress": ZOHO_EMAIL,
@@ -274,44 +291,48 @@ def send_email(access_token, account_id, to_email, subject, body, reply_to_id=No
             },
             json=payload
         )
-        result = response.json()
         if response.status_code == 200:
             logger.info(f"Email sent to {to_email}")
             return True
         else:
-            logger.error(f"Send email failed: {result}")
+            logger.error(f"Send email failed: {response.json()}")
             return False
     except Exception as e:
         logger.error(f"Send email error: {e}")
         return False
 
 
-def analyse_email(sender, subject, body, is_cc=False):
-    """Analyse email with Alex AI"""
+def analyse_email_content(sender, subject, body, is_cc=False):
     try:
         if is_cc:
-            prompt = f"""You have been CC'd on this email. Analyse it for internal SCOPE Consulting purposes only.
-Do NOT reply to sender. Just provide a brief internal analysis.
+            prompt = f"""You have been CC'd on this email. Analyse for internal SCOPE Consulting purposes ONLY.
+Do NOT write a reply. Provide internal analysis only.
 
 From: {sender}
 Subject: {subject}
 Content: {body[:3000]}
 
 Provide:
-1. Email type (MAR/RFI/BOQ/Variation/General)
-2. Key points
+1. Email type (MAR/RFI/BOQ/Variation/Claim/NCR/General)
+2. Key points — 2-3 lines maximum
 3. Action required from SCOPE team
-4. Risk level (High/Medium/Low)
-5. Suggested deadline for response"""
+4. Risk level: High/Medium/Low
+5. Recommended response deadline"""
+
         else:
             prompt = f"""You received this email directly from a SCOPE Consulting team member.
-Provide a professional, structured reply.
+Write a complete professional reply email.
 
 From: {sender}
 Subject: {subject}
 Content: {body[:3000]}
 
-Write a complete professional email reply. Match the language of the email."""
+Requirements:
+- Match the language of the email exactly
+- Professional structured format
+- Reference document numbers and clause numbers where relevant
+- Clear action items with deadlines
+- End with your signature"""
 
         response = anthropic_client.messages.create(
             model=MODEL,
@@ -326,16 +347,15 @@ Write a complete professional email reply. Match the language of the email."""
 
 
 def process_emails():
-    """Main email processing loop"""
     logger.info("Checking emails...")
     access_token = get_tokens()
     if not access_token:
-        logger.error("No access token — skipping")
+        logger.error("No access token")
         return
 
     account_id = get_account_id(access_token)
     if not account_id:
-        logger.error("No account ID — skipping")
+        logger.error("No account ID")
         return
 
     emails = fetch_unread_emails(access_token, account_id)
@@ -343,44 +363,43 @@ def process_emails():
 
     for email in emails:
         try:
-            sender = email.get("sender", "").lower()
-            subject = email.get("subject", "No subject")
-            message_id = email.get("messageId")
+            sender       = email.get("sender", "").lower()
+            subject      = email.get("subject", "No subject")
+            message_id   = email.get("messageId")
             to_addresses = email.get("toAddress", "").lower()
             cc_addresses = email.get("ccAddress", "").lower()
 
-            # Determine if direct or CC
-            is_direct = ZOHO_EMAIL.lower() in to_addresses
-            is_cc = ZOHO_EMAIL.lower() in cc_addresses
+            is_direct   = ZOHO_EMAIL.lower() in to_addresses
+            is_cc       = ZOHO_EMAIL.lower() in cc_addresses
             is_internal = any(team_email in sender for team_email in SCOPE_TEAM_EMAILS)
 
             if not is_direct and not is_cc:
                 continue
 
-            # Get full content
             body = get_email_content(access_token, account_id, message_id)
 
             if is_direct and is_internal:
-                # Internal team email — analyse and reply
-                logger.info(f"Direct from internal: {sender} — {subject}")
-                analysis = analyse_email(sender, subject, body, is_cc=False)
+                # Internal SCOPE team → analyse and reply
+                logger.info(f"Direct internal: {sender} | {subject}")
+                analysis = analyse_email_content(sender, subject, body, is_cc=False)
                 if analysis:
                     reply_subject = f"Re: {subject}" if not subject.startswith("Re:") else subject
-                    send_email(access_token, account_id, sender, reply_subject, analysis, message_id)
-                    save_email_log(sender, subject, analysis[:200], "Replied", "Closed")
+                    sent = send_email(access_token, account_id, sender, reply_subject, analysis, message_id)
+                    status = "Closed" if sent else "Open"
+                    save_to_memory(sender, subject, analysis[:300], "Replied by Alex", status)
 
             elif is_direct and not is_internal:
-                # External direct email — ignore completely
-                logger.info(f"Ignoring external direct email from: {sender}")
+                # External direct → ignore completely
+                logger.info(f"Ignoring external direct: {sender}")
                 mark_as_read(access_token, account_id, message_id)
                 continue
 
             elif is_cc:
-                # CC'd email — analyse silently for internal log
-                logger.info(f"CC'd email from: {sender} — {subject}")
-                analysis = analyse_email(sender, subject, body, is_cc=True)
+                # CC'd → silent analysis and log
+                logger.info(f"CC'd email: {sender} | {subject}")
+                analysis = analyse_email_content(sender, subject, body, is_cc=True)
                 if analysis:
-                    save_email_log(sender, subject, analysis[:200], "Logged from CC", "Monitoring")
+                    save_to_memory(sender, subject, analysis[:300], "Logged — action required", "Monitoring")
 
             mark_as_read(access_token, account_id, message_id)
 
@@ -390,45 +409,46 @@ def process_emails():
 
 
 def send_morning_report():
-    """Send daily 9:00 AM report to SCOPE team"""
     logger.info("Sending morning report...")
     try:
-        # Read email log
-        sheet = get_sheet("Email Log")
-        pending = []
-        if sheet:
-            records = sheet.get_all_records()
-            for r in records:
-                if r.get("Status") in ["Open", "Monitoring"]:
-                    pending.append(r)
+        pending, closed = read_memory_for_report()
 
-        today = datetime.now().strftime("%d.%m.%Y")
+        today    = datetime.now().strftime("%d.%m.%Y")
         day_name = datetime.now().strftime("%A")
-        day_az = {
-            "Monday": "Bazar ertəsi",
-            "Tuesday": "Çərşənbə axşamı",
+        day_az   = {
+            "Monday":    "Bazar ertəsi",
+            "Tuesday":   "Çərşənbə axşamı",
             "Wednesday": "Çərşənbə",
-            "Thursday": "Cümə axşamı",
-            "Friday": "Cümə",
-            "Saturday": "Şənbə",
-            "Sunday": "Bazar"
+            "Thursday":  "Cümə axşamı",
+            "Friday":    "Cümə",
+            "Saturday":  "Şənbə",
+            "Sunday":    "Bazar"
         }.get(day_name, day_name)
 
-        report = f"SCOPE IQ — Günlük E-poçt Hesabatı\n"
+        report  = f"SCOPE IQ — Günlük E-poçt Hesabatı\n"
         report += f"{day_az}, {today}\n"
-        report += f"{'='*40}\n\n"
+        report += f"{'='*45}\n\n"
 
         if pending:
-            report += f"CAVAB GÖZLƏYƏNLƏR: {len(pending)}\n\n"
-            for r in pending[-10:]:
-                report += f"— {r.get('Subject','?')} | {r.get('Sender','?')} | {r.get('Date','?')} | {r.get('Status','?')}\n"
+            report += f"CAVAB GÖZLƏYƏN / MONİTORİNQ: {len(pending)}\n\n"
+            for r in pending[-15:]:
+                date    = r.get('Date', '')
+                sender  = r.get('Sender', r.get('Project', '?'))
+                subject = r.get('Subject', r.get('Topic', '?'))
+                action  = r.get('Action', '')
+                status  = r.get('Status', '')
+                report += f"— {subject}\n"
+                report += f"  Göndərən: {sender} | {date} | {status}\n"
+                report += f"  Tədbirlər: {action}\n\n"
         else:
-            report += "Gözləyən e-poçt yoxdur. ✅\n"
+            report += "Gözləyən e-poçt yoxdur. ✅\n\n"
 
-        report += f"\n{'='*40}\n"
-        report += "Alex Rivera | SCOPE Consulting MMC\ninternal@scope-iq.io"
+        report += f"TAMAMLANANLAR (son 24 saat): {len([r for r in closed if r.get('Date','').startswith(today[:5])])}\n\n"
+        report += f"{'='*45}\n"
+        report += f"Alex Rivera\n"
+        report += f"Construction Expert | SCOPE Consulting MMC\n"
+        report += f"internal@scope-iq.io"
 
-        # Send to all team members
         access_token = get_tokens()
         if access_token:
             account_id = get_account_id(access_token)
@@ -441,7 +461,7 @@ def send_morning_report():
                         f"SCOPE IQ — Günlük Hesabat — {today}",
                         report
                     )
-                logger.info("Morning report sent to all team members")
+                logger.info(f"Morning report sent to {len(REPORT_RECIPIENTS)} recipients")
 
     except Exception as e:
         logger.error(f"Morning report error: {e}")
@@ -449,11 +469,14 @@ def send_morning_report():
 
 def main():
     logger.info("Alex Email Service starting...")
+    logger.info(f"Monitoring: {ZOHO_EMAIL}")
+    logger.info(f"Authorised team: {SCOPE_TEAM_EMAILS}")
+    logger.info(f"Report recipients: {REPORT_RECIPIENTS}")
 
-    # Process emails every 5 minutes
+    # Check emails every 5 minutes
     schedule.every(5).minutes.do(process_emails)
 
-    # Morning report at 9:00 AM Baku time (UTC+4 = UTC 05:00)
+    # Morning report at 9:00 AM Baku time (UTC+4 = 05:00 UTC)
     schedule.every().day.at("05:00").do(send_morning_report)
 
     # Run immediately on start
