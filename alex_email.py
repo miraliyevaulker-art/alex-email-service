@@ -1,23 +1,32 @@
 import os
 import json
 import time
+import imaplib
+import smtplib
+import email
 import schedule
-import requests
 import logging
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.header import decode_header
 from datetime import datetime
 from anthropic import Anthropic
 import gspread
 from google.oauth2.service_account import Credentials
 
 # Configuration
-ZOHO_CLIENT_ID      = os.environ.get("ZOHO_CLIENT_ID")
-ZOHO_CLIENT_SECRET  = os.environ.get("ZOHO_CLIENT_SECRET")
-ZOHO_AUTH_CODE      = os.environ.get("ZOHO_AUTH_CODE")
-ZOHO_EMAIL          = os.environ.get("ZOHO_EMAIL", "internal@scope-iq.io")
-ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY")
-GOOGLE_SHEET_ID     = "1i-DZghVlJdLdWUB4jDjCWU_5-1VSzHwgpjZiVUz0-fg"
-GOOGLE_CREDS_FILE   = "primordial-mile-495807-k9-0217981265dd.json"
-MODEL               = "claude-haiku-4-5-20251001"
+ZOHO_EMAIL        = os.environ.get("ZOHO_EMAIL", "internal@scope-iq.io")
+ZOHO_APP_PASSWORD = os.environ.get("ZOHO_APP_PASSWORD")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+GOOGLE_SHEET_ID   = "1i-DZghVlJdLdWUB4jDjCWU_5-1VSzHwgpjZiVUz0-fg"
+GOOGLE_CREDS_FILE = "primordial-mile-495807-k9-0217981265dd.json"
+MODEL             = "claude-haiku-4-5-20251001"
+
+# Zoho IMAP/SMTP settings
+IMAP_HOST = "imappro.zoho.com"
+IMAP_PORT = 993
+SMTP_HOST = "smtppro.zoho.com"
+SMTP_PORT = 465
 
 SCOPE_TEAM_EMAILS = [
     e.strip().lower() for e in
@@ -38,7 +47,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
-token_file = "/tmp/zoho_tokens.json"
 processed_ids_file = "/tmp/processed_emails.json"
 
 SYSTEM_PROMPT = """You are Alex Rivera — senior Construction Expert at SCOPE Consulting MMC.
@@ -85,7 +93,7 @@ QA/QC:
 MAR → ✅ APPROVED / ⚠️ APPROVED WITH COMMENTS / ❌ REJECTED
 Azerbaijani → ✅ TƏSDİQLƏNDİ / ⚠️ ŞƏRHLƏ TƏSDİQLƏNDİ / ❌ RƏDD EDİLDİ
 
-BOQ: Every position vs Baku market rates
+BOQ: Every position vs Baku market rates — flag HIGH/LOW/OK
 FIDIC/NEC4: Contractually correct responses always
 
 BAKU MARKET RATES:
@@ -123,9 +131,9 @@ def save_to_memory(sender, subject, summary, action, status="Open"):
         if sheet:
             date = datetime.now().strftime("%d.%m.%Y %H:%M")
             sheet.append_row([date, sender, subject, summary, action, status])
-            logger.info(f"Saved to memory: {subject}")
+            logger.info(f"Saved: {subject}")
     except Exception as e:
-        logger.error(f"Save memory error: {e}")
+        logger.error(f"Save error: {e}")
 
 
 def read_memory_for_report():
@@ -152,167 +160,64 @@ def load_processed_ids():
         return set()
 
 
-def save_processed_id(message_id):
+def save_processed_id(msg_id):
     try:
         ids = load_processed_ids()
-        ids.add(str(message_id))
-        # Keep only last 500 IDs
-        ids_list = list(ids)[-500:]
+        ids.add(str(msg_id))
         with open(processed_ids_file, "w") as f:
-            json.dump(ids_list, f)
+            json.dump(list(ids)[-500:], f)
     except Exception as e:
-        logger.error(f"Save processed ID error: {e}")
+        logger.error(f"Save ID error: {e}")
 
 
-def get_tokens():
-    if os.path.exists(token_file):
+def decode_str(s):
+    if s is None:
+        return ""
+    decoded = decode_header(s)
+    result = ""
+    for part, enc in decoded:
+        if isinstance(part, bytes):
+            result += part.decode(enc or "utf-8", errors="replace")
+        else:
+            result += str(part)
+    return result
+
+
+def get_email_body(msg):
+    body = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain":
+                try:
+                    body += part.get_payload(decode=True).decode("utf-8", errors="replace")
+                except:
+                    pass
+    else:
         try:
-            with open(token_file) as f:
-                tokens = json.load(f)
-            if tokens.get("expires_at", 0) > time.time() + 60:
-                return tokens.get("access_token")
-            if tokens.get("refresh_token"):
-                return refresh_access_token(tokens["refresh_token"])
+            body = msg.get_payload(decode=True).decode("utf-8", errors="replace")
         except:
             pass
-    return exchange_auth_code()
+    return body[:3000]
 
 
-def exchange_auth_code():
+def send_reply(to_email, subject, body, reply_to_msg_id=None):
     try:
-        response = requests.post(
-            "https://accounts.zoho.com/oauth/v2/token",
-            data={
-                "code": ZOHO_AUTH_CODE,
-                "client_id": ZOHO_CLIENT_ID,
-                "client_secret": ZOHO_CLIENT_SECRET,
-                "redirect_uri": "https://localhost",
-                "grant_type": "authorization_code"
-            }
-        )
-        data = response.json()
-        if "access_token" in data:
-            tokens = {
-                "access_token": data["access_token"],
-                "refresh_token": data.get("refresh_token"),
-                "expires_at": time.time() + data.get("expires_in", 3600)
-            }
-            with open(token_file, "w") as f:
-                json.dump(tokens, f)
-            logger.info("Tokens obtained successfully")
-            return data["access_token"]
-        else:
-            logger.error(f"Token exchange failed: {data}")
-            return None
-    except Exception as e:
-        logger.error(f"Auth code exchange error: {e}")
-        return None
+        msg = MIMEMultipart()
+        msg["From"]    = ZOHO_EMAIL
+        msg["To"]      = to_email
+        msg["Subject"] = subject
+        if reply_to_msg_id:
+            msg["In-Reply-To"] = reply_to_msg_id
+            msg["References"]  = reply_to_msg_id
+        msg.attach(MIMEText(body, "plain", "utf-8"))
 
-
-def refresh_access_token(refresh_token):
-    try:
-        response = requests.post(
-            "https://accounts.zoho.com/oauth/v2/token",
-            data={
-                "refresh_token": refresh_token,
-                "client_id": ZOHO_CLIENT_ID,
-                "client_secret": ZOHO_CLIENT_SECRET,
-                "grant_type": "refresh_token"
-            }
-        )
-        data = response.json()
-        if "access_token" in data:
-            tokens = {
-                "access_token": data["access_token"],
-                "refresh_token": refresh_token,
-                "expires_at": time.time() + data.get("expires_in", 3600)
-            }
-            with open(token_file, "w") as f:
-                json.dump(tokens, f)
-            logger.info("Access token refreshed")
-            return data["access_token"]
-        return None
-    except Exception as e:
-        logger.error(f"Token refresh error: {e}")
-        return None
-
-
-def get_account_id(access_token):
-    try:
-        response = requests.get(
-            "https://mail.zoho.com/api/accounts",
-            headers={"Authorization": f"Zoho-oauthtoken {access_token}"}
-        )
-        data = response.json()
-        accounts = data.get("data", [])
-        if accounts:
-            account_id = accounts[0].get("accountId")
-            logger.info(f"Account ID: {account_id}")
-            return account_id
-        return None
-    except Exception as e:
-        logger.error(f"Account ID error: {e}")
-        return None
-
-
-def fetch_emails(access_token, account_id):
-    """Fetch recent emails — all, not just unread"""
-    try:
-        response = requests.get(
-            f"https://mail.zoho.com/api/accounts/{account_id}/messages/view",
-            headers={"Authorization": f"Zoho-oauthtoken {access_token}"},
-            params={"limit": 25, "start": 0, "sortorder": "false"}
-        )
-        data = response.json()
-        emails = data.get("data", [])
-        logger.info(f"Fetched {len(emails)} emails")
-        return emails
-    except Exception as e:
-        logger.error(f"Fetch emails error: {e}")
-        return []
-
-
-def get_email_content(access_token, account_id, message_id):
-    try:
-        response = requests.get(
-            f"https://mail.zoho.com/api/accounts/{account_id}/messages/{message_id}/content",
-            headers={"Authorization": f"Zoho-oauthtoken {access_token}"}
-        )
-        data = response.json()
-        return data.get("data", {}).get("content", "")
-    except Exception as e:
-        logger.error(f"Get email content error: {e}")
-        return ""
-
-
-def send_email(access_token, account_id, to_email, subject, body, reply_to_id=None):
-    try:
-        payload = {
-            "fromAddress": ZOHO_EMAIL,
-            "toAddress": to_email,
-            "subject": subject,
-            "content": body,
-            "mailFormat": "plaintext"
-        }
-        if reply_to_id:
-            payload["inReplyTo"] = reply_to_id
-
-        response = requests.post(
-            f"https://mail.zoho.com/api/accounts/{account_id}/messages",
-            headers={
-                "Authorization": f"Zoho-oauthtoken {access_token}",
-                "Content-Type": "application/json"
-            },
-            json=payload
-        )
-        if response.status_code == 200:
-            logger.info(f"Email sent to {to_email} ✅")
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
+            server.login(ZOHO_EMAIL, ZOHO_APP_PASSWORD)
+            server.send_message(msg)
+            logger.info(f"Reply sent to {to_email} ✅")
             return True
-        else:
-            logger.error(f"Send failed: {response.status_code} — {response.text}")
-            return False
     except Exception as e:
-        logger.error(f"Send email error: {e}")
+        logger.error(f"Send reply error: {e}")
         return False
 
 
@@ -324,7 +229,7 @@ Do NOT write a reply. Internal analysis only.
 
 From: {sender}
 Subject: {subject}
-Content: {body[:3000]}
+Content: {body}
 
 Provide:
 1. Email type (MAR/RFI/BOQ/Variation/Claim/NCR/General)
@@ -338,7 +243,7 @@ Write a complete professional reply.
 
 From: {sender}
 Subject: {subject}
-Content: {body[:3000]}
+Content: {body}
 
 Write full professional email reply. Match the language exactly."""
 
@@ -350,80 +255,96 @@ Write full professional email reply. Match the language exactly."""
         )
         return response.content[0].text
     except Exception as e:
-        logger.error(f"Email analysis error: {e}")
+        logger.error(f"Analysis error: {e}")
         return None
 
 
 def process_emails():
-    logger.info("Checking emails...")
+    logger.info("Checking emails via IMAP...")
     processed_ids = load_processed_ids()
 
-    access_token = get_tokens()
-    if not access_token:
-        logger.error("No access token — skipping")
-        return
+    try:
+        mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+        mail.login(ZOHO_EMAIL, ZOHO_APP_PASSWORD)
+        mail.select("INBOX")
 
-    account_id = get_account_id(access_token)
-    if not account_id:
-        logger.error("No account ID — skipping")
-        return
+        # Fetch all emails
+        status, messages = mail.search(None, "ALL")
+        if status != "OK":
+            logger.error("Could not search emails")
+            return
 
-    emails = fetch_emails(access_token, account_id)
+        email_ids = messages[0].split()
+        # Process last 20 emails only
+        recent_ids = email_ids[-20:] if len(email_ids) > 20 else email_ids
+        logger.info(f"Found {len(recent_ids)} recent emails")
 
-    new_count = 0
-    for email in emails:
-        try:
-            message_id   = str(email.get("messageId", ""))
-            sender       = email.get("sender", "").lower()
-            subject      = email.get("subject", "No subject")
-            to_addresses = email.get("toAddress", "").lower()
-            cc_addresses = email.get("ccAddress", "").lower()
+        new_count = 0
+        for eid in reversed(recent_ids):
+            try:
+                msg_id_str = eid.decode()
 
-            # Skip already processed
-            if message_id in processed_ids:
+                if msg_id_str in processed_ids:
+                    continue
+
+                status, msg_data = mail.fetch(eid, "(RFC822)")
+                if status != "OK":
+                    continue
+
+                raw_email = msg_data[0][1]
+                msg = email.message_from_bytes(raw_email)
+
+                sender      = decode_str(msg.get("From", "")).lower()
+                subject     = decode_str(msg.get("Subject", "No subject"))
+                to_field    = decode_str(msg.get("To", "")).lower()
+                cc_field    = decode_str(msg.get("CC", "")).lower()
+                msg_id_hdr  = msg.get("Message-ID", "")
+
+                # Skip emails sent by Alex himself
+                if ZOHO_EMAIL.lower() in sender:
+                    save_processed_id(msg_id_str)
+                    continue
+
+                is_direct   = ZOHO_EMAIL.lower() in to_field
+                is_cc       = ZOHO_EMAIL.lower() in cc_field
+                is_internal = any(team_email in sender for team_email in SCOPE_TEAM_EMAILS)
+
+                if not is_direct and not is_cc:
+                    save_processed_id(msg_id_str)
+                    continue
+
+                new_count += 1
+                body = get_email_body(msg)
+
+                if is_direct and is_internal:
+                    logger.info(f"Direct internal: {sender} | {subject}")
+                    analysis = analyse_email_content(sender, subject, body, is_cc=False)
+                    if analysis:
+                        reply_subject = f"Re: {subject}" if not subject.startswith("Re:") else subject
+                        sent = send_reply(sender, reply_subject, analysis, msg_id_hdr)
+                        status_val = "Closed" if sent else "Open"
+                        save_to_memory(sender, subject, analysis[:300], "Replied by Alex", status_val)
+
+                elif is_direct and not is_internal:
+                    logger.info(f"Ignoring external direct: {sender}")
+
+                elif is_cc:
+                    logger.info(f"CC'd: {sender} | {subject}")
+                    analysis = analyse_email_content(sender, subject, body, is_cc=True)
+                    if analysis:
+                        save_to_memory(sender, subject, analysis[:300], "Logged — action required", "Monitoring")
+
+                save_processed_id(msg_id_str)
+
+            except Exception as e:
+                logger.error(f"Process email error: {e}")
                 continue
 
-            # Skip emails sent FROM Alex himself
-            if ZOHO_EMAIL.lower() in sender:
-                save_processed_id(message_id)
-                continue
+        mail.logout()
+        logger.info(f"Processed {new_count} new emails")
 
-            is_direct   = ZOHO_EMAIL.lower() in to_addresses
-            is_cc       = ZOHO_EMAIL.lower() in cc_addresses
-            is_internal = any(team_email in sender for team_email in SCOPE_TEAM_EMAILS)
-
-            if not is_direct and not is_cc:
-                save_processed_id(message_id)
-                continue
-
-            new_count += 1
-            body = get_email_content(access_token, account_id, message_id)
-
-            if is_direct and is_internal:
-                logger.info(f"Direct internal: {sender} | {subject}")
-                analysis = analyse_email_content(sender, subject, body, is_cc=False)
-                if analysis:
-                    reply_subject = f"Re: {subject}" if not subject.startswith("Re:") else subject
-                    sent = send_email(access_token, account_id, sender, reply_subject, analysis, message_id)
-                    status = "Closed" if sent else "Open"
-                    save_to_memory(sender, subject, analysis[:300], "Replied by Alex", status)
-
-            elif is_direct and not is_internal:
-                logger.info(f"Ignoring external direct: {sender}")
-
-            elif is_cc:
-                logger.info(f"CC'd email: {sender} | {subject}")
-                analysis = analyse_email_content(sender, subject, body, is_cc=True)
-                if analysis:
-                    save_to_memory(sender, subject, analysis[:300], "Logged — action required", "Monitoring")
-
-            save_processed_id(message_id)
-
-        except Exception as e:
-            logger.error(f"Process email error: {e}")
-            continue
-
-    logger.info(f"Processed {new_count} new emails")
+    except Exception as e:
+        logger.error(f"IMAP error: {e}")
 
 
 def send_morning_report():
@@ -460,17 +381,10 @@ def send_morning_report():
         report += f"Construction Expert | SCOPE Consulting MMC\n"
         report += f"internal@scope-iq.io"
 
-        access_token = get_tokens()
-        if access_token:
-            account_id = get_account_id(access_token)
-            if account_id:
-                for recipient in REPORT_RECIPIENTS:
-                    send_email(
-                        access_token, account_id, recipient,
-                        f"SCOPE IQ — Günlük Hesabat — {today}",
-                        report
-                    )
-                logger.info(f"Morning report sent to {len(REPORT_RECIPIENTS)} recipients ✅")
+        for recipient in REPORT_RECIPIENTS:
+            send_reply(recipient, f"SCOPE IQ — Günlük Hesabat — {today}", report)
+
+        logger.info(f"Morning report sent ✅")
 
     except Exception as e:
         logger.error(f"Morning report error: {e}")
@@ -479,8 +393,8 @@ def send_morning_report():
 def main():
     logger.info("Alex Email Service starting...")
     logger.info(f"Monitoring: {ZOHO_EMAIL}")
+    logger.info(f"IMAP: {IMAP_HOST}:{IMAP_PORT}")
     logger.info(f"Authorised team: {SCOPE_TEAM_EMAILS}")
-    logger.info(f"Report recipients: {REPORT_RECIPIENTS}")
 
     # Check emails every 5 minutes
     schedule.every(5).minutes.do(process_emails)
@@ -488,7 +402,7 @@ def main():
     # Morning report 9:00 AM Baku (UTC+4 = 05:00 UTC)
     schedule.every().day.at("05:00").do(send_morning_report)
 
-    # Run immediately on start
+    # Run immediately
     process_emails()
 
     while True:
