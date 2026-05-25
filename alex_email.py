@@ -24,7 +24,7 @@ MODEL             = "claude-haiku-4-5-20251001"
 IMAP_HOST = "imappro.zoho.com"
 IMAP_PORT = 993
 SMTP_HOST = "smtppro.zoho.com"
-SMTP_PORT = 587
+SMTP_PORT = 2525
 
 SCOPE_TEAM_EMAILS = [
     e.strip().lower() for e in
@@ -121,6 +121,8 @@ def save_to_memory(sender, subject, summary, action, status="Open"):
                 sender, subject, summary, action, status
             ])
             logger.info(f"✅ Saved: {subject}")
+        else:
+            logger.error("Sheet not accessible")
     except Exception as e:
         logger.error(f"Save error: {e}")
 
@@ -199,27 +201,44 @@ def get_email_body(msg):
 
 
 def send_reply(to_email, subject, body, reply_to_msg_id=None):
-    try:
-        msg = MIMEMultipart()
-        msg["From"]    = ZOHO_EMAIL
-        msg["To"]      = to_email
-        msg["Subject"] = subject
-        if reply_to_msg_id:
-            msg["In-Reply-To"] = str(reply_to_msg_id)
-            msg["References"]  = str(reply_to_msg_id)
-        msg.attach(MIMEText(body, "plain", "utf-8"))
+    """Try multiple SMTP ports"""
+    ports_to_try = [2525, 587, 465]
 
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-            server.login(ZOHO_EMAIL, ZOHO_APP_PASSWORD)
-            server.send_message(msg)
-            logger.info(f"✅ Reply sent to {to_email}")
+    for port in ports_to_try:
+        try:
+            msg = MIMEMultipart()
+            msg["From"]    = ZOHO_EMAIL
+            msg["To"]      = to_email
+            msg["Subject"] = subject
+            if reply_to_msg_id:
+                msg["In-Reply-To"] = str(reply_to_msg_id)
+                msg["References"]  = str(reply_to_msg_id)
+            msg.attach(MIMEText(body, "plain", "utf-8"))
+
+            if port == 465:
+                with smtplib.SMTP_SSL(SMTP_HOST, port) as server:
+                    server.login(ZOHO_EMAIL, ZOHO_APP_PASSWORD)
+                    server.send_message(msg)
+            else:
+                with smtplib.SMTP(SMTP_HOST, port, timeout=15) as server:
+                    server.ehlo()
+                    try:
+                        server.starttls()
+                        server.ehlo()
+                    except:
+                        pass
+                    server.login(ZOHO_EMAIL, ZOHO_APP_PASSWORD)
+                    server.send_message(msg)
+
+            logger.info(f"✅ Reply sent to {to_email} via port {port}")
             return True
-    except Exception as e:
-        logger.error(f"SMTP error: {e}")
-        return False
+
+        except Exception as e:
+            logger.warning(f"Port {port} failed: {e}")
+            continue
+
+    logger.error(f"All SMTP ports failed for {to_email}")
+    return False
 
 
 def analyse_email(sender, subject, body, is_cc=False):
@@ -270,7 +289,7 @@ def process_emails():
 
         typ, data = mail.search(None, "ALL")
         if typ != "OK" or not data or not data[0]:
-            logger.info("Inbox empty or search failed")
+            logger.info("Inbox empty")
             mail.logout()
             return
 
@@ -423,7 +442,7 @@ def main():
     logger.info("Alex Email Service starting...")
     logger.info(f"Email: {ZOHO_EMAIL}")
     logger.info(f"IMAP: {IMAP_HOST}:{IMAP_PORT}")
-    logger.info(f"SMTP: {SMTP_HOST}:{SMTP_PORT}")
+    logger.info(f"SMTP: {SMTP_HOST} — trying ports 2525, 587, 465")
     logger.info(f"Team: {SCOPE_TEAM_EMAILS}")
     logger.info(f"Reports to: {REPORT_RECIPIENTS}")
     logger.info("=" * 50)
