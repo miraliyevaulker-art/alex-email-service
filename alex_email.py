@@ -24,7 +24,7 @@ MODEL             = "claude-haiku-4-5-20251001"
 IMAP_HOST = "imappro.zoho.com"
 IMAP_PORT = 993
 SMTP_HOST = "smtppro.zoho.com"
-SMTP_PORT = 465
+SMTP_PORT = 587
 
 SCOPE_TEAM_EMAILS = [
     e.strip().lower() for e in
@@ -81,7 +81,15 @@ internal@scope-iq.io
 
 QA/QC: MAR → ✅ APPROVED / ⚠️ WITH COMMENTS / ❌ REJECTED
 BOQ: Every position vs Baku market rates
-FIDIC/NEC4: Contractually correct always"""
+FIDIC/NEC4: Contractually correct always
+
+BAKU MARKET RATES:
+TORPAQ: Mexaniki qazıntı 8-15 AZN/m³, Əl qazıntı 60-90 AZN/m³
+BETON: C25/30 190-240 AZN/m³, Armatur 1200-1500 AZN/ton
+HÖRGÜ: Kərpic xarici 25-40 AZN/m², Suvaq 16-24 AZN/m²
+BƏZƏYİŞ: Kafel 25-40 AZN/m², Alçipan 32-48 AZN/m², Boya 12-18 AZN/m²
+MEP: Hava kanalları 45-75 AZN/m², Fankoyl 350-600 AZN/ədəd
+QAPI: Metal qapı 4500-6500 AZN/ədəd, Alüminium qapı 700-900 AZN/ədəd"""
 
 
 def get_sheet(tab="Sheet1"):
@@ -112,7 +120,7 @@ def save_to_memory(sender, subject, summary, action, status="Open"):
                 datetime.now().strftime("%d.%m.%Y %H:%M"),
                 sender, subject, summary, action, status
             ])
-            logger.info(f"Saved to memory: {subject}")
+            logger.info(f"✅ Saved: {subject}")
     except Exception as e:
         logger.error(f"Save error: {e}")
 
@@ -152,12 +160,9 @@ def save_processed_id(msg_id):
 
 
 def safe_decode(value, fallback=""):
-    """Safely decode email header value"""
     if value is None:
         return fallback
     try:
-        if isinstance(value, bytes):
-            return value.decode("utf-8", errors="replace")
         parts = decode_header(str(value))
         result = ""
         for part, enc in parts:
@@ -171,7 +176,6 @@ def safe_decode(value, fallback=""):
 
 
 def get_email_body(msg):
-    """Extract plain text body from email"""
     body = ""
     try:
         if msg.is_multipart():
@@ -180,10 +184,8 @@ def get_email_body(msg):
                     if part.get_content_type() == "text/plain":
                         payload = part.get_payload(decode=True)
                         if payload:
-                            body += payload.decode(
-                                part.get_content_charset() or "utf-8",
-                                errors="replace"
-                            )
+                            charset = part.get_content_charset() or "utf-8"
+                            body += payload.decode(charset, errors="replace")
                 except:
                     continue
         else:
@@ -192,12 +194,11 @@ def get_email_body(msg):
                 charset = msg.get_content_charset() or "utf-8"
                 body = payload.decode(charset, errors="replace")
     except Exception as e:
-        logger.error(f"Body extraction error: {e}")
+        logger.error(f"Body error: {e}")
     return body[:3000]
 
 
 def send_reply(to_email, subject, body, reply_to_msg_id=None):
-    """Send email via SMTP"""
     try:
         msg = MIMEMultipart()
         msg["From"]    = ZOHO_EMAIL
@@ -208,7 +209,10 @@ def send_reply(to_email, subject, body, reply_to_msg_id=None):
             msg["References"]  = str(reply_to_msg_id)
         msg.attach(MIMEText(body, "plain", "utf-8"))
 
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
             server.login(ZOHO_EMAIL, ZOHO_APP_PASSWORD)
             server.send_message(msg)
             logger.info(f"✅ Reply sent to {to_email}")
@@ -219,7 +223,6 @@ def send_reply(to_email, subject, body, reply_to_msg_id=None):
 
 
 def analyse_email(sender, subject, body, is_cc=False):
-    """Analyse email with Claude"""
     try:
         if is_cc:
             prompt = f"""CC'd email — internal analysis only. Do NOT write a reply.
@@ -260,32 +263,23 @@ def process_emails():
     processed_ids = load_processed_ids()
 
     try:
-        # Connect to IMAP
         mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
         mail.login(ZOHO_EMAIL, ZOHO_APP_PASSWORD)
         logger.info("✅ IMAP login successful")
         mail.select("INBOX")
 
-        # Search all emails
         typ, data = mail.search(None, "ALL")
-        if typ != "OK":
-            logger.error("Search failed")
-            mail.logout()
-            return
-
-        # Handle empty inbox
-        if not data or not data[0]:
-            logger.info("Inbox empty")
+        if typ != "OK" or not data or not data[0]:
+            logger.info("Inbox empty or search failed")
             mail.logout()
             return
 
         all_ids = data[0].split()
         if not all_ids:
-            logger.info("No emails found")
+            logger.info("No emails")
             mail.logout()
             return
 
-        # Process last 25 emails
         recent = all_ids[-25:]
         logger.info(f"Checking {len(recent)} recent emails")
         new_count = 0
@@ -294,11 +288,9 @@ def process_emails():
             try:
                 eid_str = eid.decode() if isinstance(eid, bytes) else str(eid)
 
-                # Skip already processed
                 if eid_str in processed_ids:
                     continue
 
-                # Fetch email
                 typ, msg_data = mail.fetch(eid, "(RFC822)")
                 if typ != "OK" or not msg_data or not msg_data[0]:
                     save_processed_id(eid_str)
@@ -311,14 +303,12 @@ def process_emails():
 
                 msg = email.message_from_bytes(raw)
 
-                # Extract headers safely
                 sender   = safe_decode(msg.get("From"),    "").lower()
                 subject  = safe_decode(msg.get("Subject"), "No subject")
                 to_field = safe_decode(msg.get("To"),      "").lower()
                 cc_field = safe_decode(msg.get("CC"),      "").lower()
                 msg_hdr  = safe_decode(msg.get("Message-ID"), "")
 
-                # Skip Alex's own sent emails
                 if ZOHO_EMAIL.lower() in sender:
                     save_processed_id(eid_str)
                     continue
@@ -327,7 +317,6 @@ def process_emails():
                 is_cc_email = ZOHO_EMAIL.lower() in cc_field
                 is_internal = any(t in sender for t in SCOPE_TEAM_EMAILS)
 
-                # Skip if not relevant
                 if not is_direct and not is_cc_email:
                     save_processed_id(eid_str)
                     continue
@@ -337,7 +326,6 @@ def process_emails():
                 logger.info(f"Processing: {sender} | {subject}")
 
                 if is_direct and is_internal:
-                    # Internal SCOPE team → reply
                     analysis = analyse_email(sender, subject, body, is_cc=False)
                     if analysis:
                         reply_sub = f"Re: {subject}" if not subject.startswith("Re:") else subject
@@ -349,11 +337,9 @@ def process_emails():
                         )
 
                 elif is_direct and not is_internal:
-                    # External direct → ignore
-                    logger.info(f"Ignoring external direct: {sender}")
+                    logger.info(f"Ignoring external: {sender}")
 
                 elif is_cc_email:
-                    # CC'd → silent log
                     analysis = analyse_email(sender, subject, body, is_cc=True)
                     if analysis:
                         save_to_memory(
@@ -378,7 +364,7 @@ def process_emails():
     except imaplib.IMAP4.error as e:
         logger.error(f"IMAP auth error: {e}")
     except Exception as e:
-        logger.error(f"IMAP connection error: {e}")
+        logger.error(f"IMAP error: {e}")
 
 
 def send_morning_report():
@@ -437,17 +423,14 @@ def main():
     logger.info("Alex Email Service starting...")
     logger.info(f"Email: {ZOHO_EMAIL}")
     logger.info(f"IMAP: {IMAP_HOST}:{IMAP_PORT}")
+    logger.info(f"SMTP: {SMTP_HOST}:{SMTP_PORT}")
     logger.info(f"Team: {SCOPE_TEAM_EMAILS}")
     logger.info(f"Reports to: {REPORT_RECIPIENTS}")
     logger.info("=" * 50)
 
-    # Check every 5 minutes
     schedule.every(5).minutes.do(process_emails)
-
-    # Morning report 9:00 AM Baku = 05:00 UTC
     schedule.every().day.at("05:00").do(send_morning_report)
 
-    # Run immediately on start
     process_emails()
 
     while True:
