@@ -5,7 +5,6 @@ import imaplib
 import email
 import schedule
 import logging
-import requests
 from email.header import decode_header
 from datetime import datetime
 from anthropic import Anthropic
@@ -17,7 +16,7 @@ ZOHO_EMAIL        = os.environ.get("ZOHO_EMAIL", "internal@scope-iq.io")
 ZOHO_APP_PASSWORD = os.environ.get("ZOHO_APP_PASSWORD")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 RESEND_API_KEY    = os.environ.get("RESEND_API_KEY")
-GOOGLE_SHEET_ID   = "1i-DZghVlJdLdWUB4jDjCWU_5-1VSzHwgpjZiVUz0-fg"
+GOOGLE_SHEET_ID   = os.environ.get("GOOGLE_SHEET_ID", "1_4L63VqFN6etwLRWW2zT0WyJTHUT8LLTWwqiNPJJR4w")
 GOOGLE_CREDS_FILE = "primordial-mile-495807-k9-0217981265dd.json"
 MODEL             = "claude-haiku-4-5-20251001"
 
@@ -45,49 +44,40 @@ logger = logging.getLogger(__name__)
 anthropic_client   = Anthropic(api_key=ANTHROPIC_API_KEY)
 processed_ids_file = "/tmp/processed_emails.json"
 
-SYSTEM_PROMPT = """You are Alex Rivera — senior Construction Expert at SCOPE Consulting MMC.
+SYSTEM_PROMPT = """You are Alex Rivera, Construction Expert at SCOPE Consulting MMC.
 
-25+ years across commercial, residential, infrastructure, oil & gas, and high-end fit-out projects in Europe, Middle East, and CIS countries including Azerbaijan.
+You have 25 years of experience across commercial, residential, infrastructure, oil and gas, and high-end fit-out projects in Europe, the Middle East, and CIS countries including Azerbaijan.
 
-YOUR EXPERTISE:
-- Quantity Surveying and Cost Management
-- Quality Assurance and Quality Control (QA/QC)
-- Contract Administration (FIDIC, NEC4, AzDTN)
-- Technical document review — all disciplines
-- Materials and specifications
-- Handover and commissioning
-- Claims and variations
-- Eurocodes, British Standards, ISO, GOST, AzDTN, SNiP standards
+Your areas of expertise include Quantity Surveying, Cost Management, Quality Assurance and Quality Control, Contract Administration under FIDIC and NEC4, technical document review across all disciplines, materials and specifications, handover and commissioning, claims and variations, and all major construction standards including Eurocodes, British Standards, ISO, GOST, AzDTN and SNiP.
 
 LANGUAGE RULES:
-1. English email → English reply ONLY
-2. Azerbaijani email → Azerbaijani reply ONLY
-3. Mixed → dominant language
-4. NEVER mix languages
+- Default language is English. Always reply in English unless the incoming email is written entirely in Azerbaijani.
+- If the email is in Azerbaijani, reply in Azerbaijani using correct formal register and proper special characters: ə ı ö ü ğ ş ç.
+- Never mix languages in one reply.
 
-AZERBAIJANI: ə ı ö ü ğ ş ç — mandatory. AzDTN/GOST terminology. Formal register.
+EMAIL WRITING STYLE - CRITICAL:
+- Write exactly like a senior construction professional writing a formal business email.
+- Use plain professional prose only. No bullet points, no symbols, no emojis, no checkmarks, no arrows, no dashes used as decoration, no hashtags.
+- Paragraphs separated by blank lines.
+- Begin with a formal salutation such as Dear Alishir, or Dear Team, as appropriate.
+- End with a formal closing such as Kind regards or Yours sincerely.
+- Be direct, confident and senior in tone. Never start with Certainly or Great question.
+- Keep responses concise and actionable.
 
-EMAIL REPLY FORMAT:
-Professional, structured, concise.
-Reference document numbers where relevant.
-Clear action items with deadlines.
+SIGNATURE — always end every email with exactly this:
 
-Signature:
 Alex Rivera
-Construction Expert | SCOPE Consulting MMC
+Construction Expert
+SCOPE Consulting MMC
 internal@scope-iq.io
 
-QA/QC: MAR → ✅ APPROVED / ⚠️ WITH COMMENTS / ❌ REJECTED
-BOQ: Every position vs Baku market rates
-FIDIC/NEC4: Contractually correct always
+QA/QC RESPONSES:
+For MAR reviews state Approved, Approved with Comments, or Rejected in plain sentences with clear reasons referencing specification clauses.
+For BOQ reviews assess each position against Baku market rates in plain professional language.
+For contractual matters apply FIDIC or NEC4 as appropriate with formal contractual language.
 
-BAKU MARKET RATES:
-TORPAQ: Mexaniki qazıntı 8-15 AZN/m³, Əl qazıntı 60-90 AZN/m³
-BETON: C25/30 190-240 AZN/m³, Armatur 1200-1500 AZN/ton
-HÖRGÜ: Kərpic xarici 25-40 AZN/m², Suvaq 16-24 AZN/m²
-BƏZƏYİŞ: Kafel 25-40 AZN/m², Alçipan 32-48 AZN/m², Boya 12-18 AZN/m²
-MEP: Hava kanalları 45-75 AZN/m², Fankoyl 350-600 AZN/ədəd
-QAPI: Metal qapı 4500-6500 AZN/ədəd, Alüminium qapı 700-900 AZN/ədəd"""
+BAKU MARKET RATES FOR REFERENCE:
+Mechanical excavation 8 to 15 AZN per cubic metre, Manual excavation 60 to 90 AZN per cubic metre, Concrete C25/30 190 to 240 AZN per cubic metre, Reinforcement 1200 to 1500 AZN per tonne, Formwork 18 to 28 AZN per square metre, External brickwork 25 to 40 AZN per square metre, Plastering 16 to 24 AZN per square metre, Ceramic tiles 25 to 40 AZN per square metre, Gypsum partition 32 to 48 AZN per square metre, Paint 12 to 18 AZN per square metre, HVAC ductwork 45 to 75 AZN per square metre, Fan coil unit 350 to 600 AZN each, Lighting fixture 45 to 120 AZN each, Sprinkler system 45 to 75 AZN per square metre, Metal door 4500 to 6500 AZN each, Aluminium door 700 to 900 AZN each."""
 
 
 def get_sheet(tab="Sheet1"):
@@ -118,7 +108,7 @@ def save_to_memory(sender, subject, summary, action, status="Open"):
                 datetime.now().strftime("%d.%m.%Y %H:%M"),
                 sender, subject, summary, action, status
             ])
-            logger.info(f"✅ Saved: {subject}")
+            logger.info(f"Saved: {subject}")
         else:
             logger.error("Sheet not accessible")
     except Exception as e:
@@ -198,22 +188,18 @@ def get_email_body(msg):
     return body[:3000]
 
 
-def send_reply(to_email, subject, body):
-    """Send email via Resend API — uses HTTPS port 443"""
+def send_email(to_email, subject, body):
     try:
         resend.api_key = RESEND_API_KEY
-
         params = {
             "from": f"Alex Rivera <{ZOHO_EMAIL}>",
             "to": [to_email],
             "subject": subject,
             "text": body
         }
-
-        email_response = resend.Emails.send(params)
-        logger.info(f"✅ Reply sent to {to_email} via Resend")
+        resend.Emails.send(params)
+        logger.info(f"Email sent to {to_email}")
         return True
-
     except Exception as e:
         logger.error(f"Resend error: {e}")
         return False
@@ -222,26 +208,22 @@ def send_reply(to_email, subject, body):
 def analyse_email(sender, subject, body, is_cc=False):
     try:
         if is_cc:
-            prompt = f"""CC'd email — internal analysis only. Do NOT write a reply.
+            prompt = f"""You have been copied on the following email. Analyse it for internal SCOPE Consulting purposes only. Do not write a reply to the sender.
 
 From: {sender}
 Subject: {subject}
 Content: {body}
 
-Provide:
-1. Type: MAR/RFI/BOQ/Variation/Claim/NCR/General
-2. Key points (2-3 lines)
-3. Action needed from SCOPE team
-4. Risk: High/Medium/Low
-5. Response deadline"""
+Provide a brief internal assessment covering the following: the type of email (such as MAR, RFI, BOQ, Variation, Claim, NCR, or General), the key points in two or three sentences, the action required from the SCOPE team, the risk level as High, Medium or Low, and a recommended deadline for response."""
+
         else:
-            prompt = f"""Email from SCOPE team member — write professional reply.
+            prompt = f"""You have received the following email directly from a SCOPE Consulting team member. Write a complete professional reply.
 
 From: {sender}
 Subject: {subject}
 Content: {body}
 
-Write complete professional reply. Match language exactly."""
+Write a formal professional email reply. Default to English unless the email above is written entirely in Azerbaijani. Follow the email writing style in your instructions exactly."""
 
         response = anthropic_client.messages.create(
             model=MODEL,
@@ -262,7 +244,7 @@ def process_emails():
     try:
         mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
         mail.login(ZOHO_EMAIL, ZOHO_APP_PASSWORD)
-        logger.info("✅ IMAP login successful")
+        logger.info("IMAP login successful")
         mail.select("INBOX")
 
         typ, data = mail.search(None, "ALL")
@@ -325,7 +307,7 @@ def process_emails():
                     analysis = analyse_email(sender, subject, body, is_cc=False)
                     if analysis:
                         reply_sub = f"Re: {subject}" if not subject.startswith("Re:") else subject
-                        sent = send_reply(sender, reply_sub, analysis)
+                        sent = send_email(sender, reply_sub, analysis)
                         save_to_memory(
                             sender, subject, analysis[:300],
                             "Replied by Alex",
@@ -355,7 +337,7 @@ def process_emails():
                 continue
 
         mail.logout()
-        logger.info(f"✅ Done — {new_count} new emails processed")
+        logger.info(f"Done — {new_count} new emails processed")
 
     except imaplib.IMAP4.error as e:
         logger.error(f"IMAP auth error: {e}")
@@ -367,62 +349,55 @@ def send_morning_report():
     logger.info("Sending morning report...")
     try:
         pending, closed = read_memory_for_report()
-        today    = datetime.now().strftime("%d.%m.%Y")
+        today    = datetime.now().strftime("%d %B %Y")
         day_name = datetime.now().strftime("%A")
-        day_az   = {
-            "Monday":    "Bazar ertəsi",
-            "Tuesday":   "Çərşənbə axşamı",
-            "Wednesday": "Çərşənbə",
-            "Thursday":  "Cümə axşamı",
-            "Friday":    "Cümə",
-            "Saturday":  "Şənbə",
-            "Sunday":    "Bazar"
-        }.get(day_name, day_name)
-
-        report  = f"SCOPE IQ — Günlük E-poçt Hesabatı\n"
-        report += f"{day_az}, {today}\n"
-        report += "=" * 45 + "\n\n"
 
         if pending:
-            report += f"CAVAB GÖZLƏYƏN / MONİTORİNQ: {len(pending)}\n\n"
-            for r in pending[-15:]:
-                subj   = r.get("Subject") or r.get("Topic") or "?"
-                sender = r.get("Sender") or r.get("Project") or "?"
+            report  = f"Dear Team,\n\n"
+            report += f"Good morning. Please find below a summary of outstanding emails and open action items as of {today}.\n\n"
+
+            for i, r in enumerate(pending[-15:], 1):
+                subj   = r.get("Subject") or r.get("Topic") or "No subject"
+                sender = r.get("Sender") or r.get("Project") or "Unknown"
                 date   = r.get("Date") or ""
                 status = r.get("Status") or ""
-                action = r.get("Action") or ""
-                report += f"— {subj}\n"
-                report += f"  {sender} | {date} | {status}\n"
-                report += f"  {action}\n\n"
-        else:
-            report += "Gözləyən e-poçt yoxdur. ✅\n\n"
+                action = r.get("Action") or "Action required"
+                report += f"{i}. Subject: {subj}\n"
+                report += f"   From: {sender}\n"
+                report += f"   Date logged: {date}\n"
+                report += f"   Status: {status}\n"
+                report += f"   Action required: {action}\n\n"
 
-        report += "=" * 45 + "\n"
+            report += "Please review the above items and take the necessary action at your earliest convenience.\n\n"
+
+        else:
+            report  = f"Dear Team,\n\n"
+            report += f"Good morning. As of {today}, there are no outstanding emails or open action items requiring your attention.\n\n"
+            report += "Should you have any queries or wish to submit documents for review, please send them directly to this address.\n\n"
+
+        report += "Kind regards,\n\n"
         report += "Alex Rivera\n"
-        report += "Construction Expert | SCOPE Consulting MMC\n"
+        report += "Construction Expert\n"
+        report += "SCOPE Consulting MMC\n"
         report += "internal@scope-iq.io"
 
         for recipient in REPORT_RECIPIENTS:
-            send_reply(
+            send_email(
                 recipient,
-                f"SCOPE IQ — Günlük Hesabat — {today}",
+                f"SCOPE IQ Daily Report — {today}",
                 report
             )
-        logger.info("✅ Morning report sent")
+        logger.info("Morning report sent")
 
     except Exception as e:
         logger.error(f"Morning report error: {e}")
 
 
 def main():
-    logger.info("=" * 50)
-    logger.info("Alex Email Service starting...")
-    logger.info(f"Email: {ZOHO_EMAIL}")
-    logger.info(f"IMAP: {IMAP_HOST}:{IMAP_PORT}")
-    logger.info(f"Sending via: Resend API")
-    logger.info(f"Team: {SCOPE_TEAM_EMAILS}")
-    logger.info(f"Reports to: {REPORT_RECIPIENTS}")
-    logger.info("=" * 50)
+    logger.info("Alex Email Service starting")
+    logger.info(f"Monitoring: {ZOHO_EMAIL}")
+    logger.info(f"Authorised team: {SCOPE_TEAM_EMAILS}")
+    logger.info(f"Report recipients: {REPORT_RECIPIENTS}")
 
     schedule.every(5).minutes.do(process_emails)
     schedule.every().day.at("05:00").do(send_morning_report)
