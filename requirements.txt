@@ -1,6 +1,8 @@
 anthropic
-requests
 gspread
 google-auth
 schedule
 resend
+openpyxl
+pymupdf
+python-docx
