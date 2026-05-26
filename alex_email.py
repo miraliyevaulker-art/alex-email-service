@@ -41,8 +41,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-anthropic_client   = Anthropic(api_key=ANTHROPIC_API_KEY)
-processed_ids_file = "/tmp/processed_emails.json"
+anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# Local cache for processed IDs — loaded from sheet on start
+_processed_ids_cache = None
 
 SYSTEM_PROMPT = """You are Alex Rivera, Construction Expert at SCOPE Consulting MMC.
 
@@ -80,24 +82,87 @@ BAKU MARKET RATES FOR REFERENCE:
 Mechanical excavation 8 to 15 AZN per cubic metre, Manual excavation 60 to 90 AZN per cubic metre, Concrete C25/30 190 to 240 AZN per cubic metre, Reinforcement 1200 to 1500 AZN per tonne, Formwork 18 to 28 AZN per square metre, External brickwork 25 to 40 AZN per square metre, Plastering 16 to 24 AZN per square metre, Ceramic tiles 25 to 40 AZN per square metre, Gypsum partition 32 to 48 AZN per square metre, Paint 12 to 18 AZN per square metre, HVAC ductwork 45 to 75 AZN per square metre, Fan coil unit 350 to 600 AZN each, Lighting fixture 45 to 120 AZN each, Sprinkler system 45 to 75 AZN per square metre, Metal door 4500 to 6500 AZN each, Aluminium door 700 to 900 AZN each."""
 
 
+def get_gspread_client():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+    if creds_json:
+        creds = Credentials.from_service_account_info(
+            json.loads(creds_json), scopes=scopes)
+    else:
+        creds = Credentials.from_service_account_file(
+            GOOGLE_CREDS_FILE, scopes=scopes)
+    return gspread.authorize(creds)
+
+
 def get_sheet(tab="Sheet1"):
     try:
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
-        ]
-        creds_json = os.environ.get("GOOGLE_CREDENTIALS")
-        if creds_json:
-            creds = Credentials.from_service_account_info(
-                json.loads(creds_json), scopes=scopes)
-        else:
-            creds = Credentials.from_service_account_file(
-                GOOGLE_CREDS_FILE, scopes=scopes)
-        client = gspread.authorize(creds)
+        client = get_gspread_client()
         return client.open_by_key(GOOGLE_SHEET_ID).worksheet(tab)
     except Exception as e:
         logger.error(f"Sheet error: {e}")
         return None
+
+
+def get_or_create_processed_sheet():
+    """Get or create Processed Emails tab in Google Sheet"""
+    try:
+        client = get_gspread_client()
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+        try:
+            return spreadsheet.worksheet("Processed Emails")
+        except:
+            sheet = spreadsheet.add_worksheet(
+                title="Processed Emails", rows=2000, cols=2)
+            sheet.append_row(["Email ID", "Processed At"])
+            return sheet
+    except Exception as e:
+        logger.error(f"Processed sheet error: {e}")
+        return None
+
+
+def load_processed_ids():
+    """Load processed IDs from Google Sheet — survives redeploys"""
+    global _processed_ids_cache
+    if _processed_ids_cache is not None:
+        return _processed_ids_cache
+    try:
+        sheet = get_or_create_processed_sheet()
+        if sheet:
+            records = sheet.get_all_values()
+            ids = set()
+            for row in records[1:]:  # Skip header
+                if row and row[0]:
+                    ids.add(str(row[0]))
+            _processed_ids_cache = ids
+            logger.info(f"Loaded {len(ids)} processed email IDs from sheet")
+            return ids
+    except Exception as e:
+        logger.error(f"Load processed IDs error: {e}")
+    _processed_ids_cache = set()
+    return _processed_ids_cache
+
+
+def save_processed_id(msg_id):
+    """Save processed ID to Google Sheet permanently"""
+    global _processed_ids_cache
+    try:
+        msg_id_str = str(msg_id)
+        if _processed_ids_cache is not None:
+            if msg_id_str in _processed_ids_cache:
+                return
+            _processed_ids_cache.add(msg_id_str)
+
+        sheet = get_or_create_processed_sheet()
+        if sheet:
+            sheet.append_row([
+                msg_id_str,
+                datetime.now().strftime("%d.%m.%Y %H:%M")
+            ])
+    except Exception as e:
+        logger.error(f"Save processed ID error: {e}")
 
 
 def save_to_memory(sender, subject, summary, action, status="Open"):
@@ -127,26 +192,6 @@ def read_memory_for_report():
     except Exception as e:
         logger.error(f"Read memory error: {e}")
         return [], []
-
-
-def load_processed_ids():
-    try:
-        if os.path.exists(processed_ids_file):
-            with open(processed_ids_file) as f:
-                return set(json.load(f))
-    except:
-        pass
-    return set()
-
-
-def save_processed_id(msg_id):
-    try:
-        ids = load_processed_ids()
-        ids.add(str(msg_id))
-        with open(processed_ids_file, "w") as f:
-            json.dump(list(ids)[-1000:], f)
-    except Exception as e:
-        logger.error(f"Save ID error: {e}")
 
 
 def safe_decode(value, fallback=""):
@@ -476,6 +521,9 @@ def main():
     logger.info(f"Monitoring: {ZOHO_EMAIL}")
     logger.info(f"Authorised team: {SCOPE_TEAM_EMAILS}")
     logger.info(f"Report recipients: {REPORT_RECIPIENTS}")
+
+    # Pre-load processed IDs on startup
+    load_processed_ids()
 
     schedule.every(5).minutes.do(process_emails)
     schedule.every().day.at("05:00").do(send_morning_report)
