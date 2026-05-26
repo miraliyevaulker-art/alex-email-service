@@ -51,18 +51,18 @@ You have 25 years of experience across commercial, residential, infrastructure, 
 Your areas of expertise include Quantity Surveying, Cost Management, Quality Assurance and Quality Control, Contract Administration under FIDIC and NEC4, technical document review across all disciplines, materials and specifications, handover and commissioning, claims and variations, and all major construction standards including Eurocodes, British Standards, ISO, GOST, AzDTN and SNiP.
 
 LANGUAGE RULES:
-- Default language is English. Always reply in English unless the incoming email is written entirely in Azerbaijani.
-- If the email is in Azerbaijani, reply in Azerbaijani using correct formal register and proper special characters: ə ı ö ü ğ ş ç.
-- Never mix languages in one reply.
+Default language is English. Always reply in English unless the incoming email is written entirely in Azerbaijani.
+If the email is in Azerbaijani, reply in Azerbaijani using correct formal register and proper special characters: ə ı ö ü ğ ş ç.
+Never mix languages in one reply.
 
 EMAIL WRITING STYLE - CRITICAL:
-- Write exactly like a senior construction professional writing a formal business email.
-- Use plain professional prose only. No bullet points, no symbols, no emojis, no checkmarks, no arrows, no dashes used as decoration, no hashtags.
-- Paragraphs separated by blank lines.
-- Begin with a formal salutation such as Dear Alishir, or Dear Team, as appropriate.
-- End with a formal closing such as Kind regards or Yours sincerely.
-- Be direct, confident and senior in tone. Never start with Certainly or Great question.
-- Keep responses concise and actionable.
+Write exactly like a senior construction professional writing a formal business email.
+Use plain professional prose only. No bullet points, no symbols, no emojis, no checkmarks, no arrows, no dashes used as decoration, no hashtags.
+Paragraphs separated by blank lines.
+Begin with a formal salutation such as Dear Alishir, or Dear Team, as appropriate.
+End with a formal closing such as Kind regards or Yours sincerely.
+Be direct, confident and senior in tone. Never start with Certainly or Great question.
+Keep responses concise and actionable.
 
 SIGNATURE — always end every email with exactly this:
 
@@ -144,7 +144,7 @@ def save_processed_id(msg_id):
         ids = load_processed_ids()
         ids.add(str(msg_id))
         with open(processed_ids_file, "w") as f:
-            json.dump(list(ids)[-500:], f)
+            json.dump(list(ids)[-1000:], f)
     except Exception as e:
         logger.error(f"Save ID error: {e}")
 
@@ -163,6 +163,29 @@ def safe_decode(value, fallback=""):
         return result
     except:
         return str(value) if value else fallback
+
+
+def extract_email_address(header_value):
+    if not header_value:
+        return ""
+    header_str = safe_decode(header_value)
+    if "<" in header_str and ">" in header_str:
+        start = header_str.rfind("<") + 1
+        end   = header_str.rfind(">")
+        return header_str[start:end].strip().lower()
+    return header_str.strip().lower()
+
+
+def extract_all_emails(header_value):
+    if not header_value:
+        return []
+    header_str = safe_decode(header_value)
+    addresses  = []
+    for part in header_str.split(","):
+        addr = extract_email_address(part.strip())
+        if addr and "@" in addr:
+            addresses.append(addr)
+    return addresses
 
 
 def get_email_body(msg):
@@ -188,18 +211,38 @@ def get_email_body(msg):
     return body[:3000]
 
 
-def send_email(to_email, subject, body):
+def send_email(to_emails, subject, body, reply_to_msg_id=None, references=None):
+    """Send email via Resend API — supports Reply All"""
     try:
         resend.api_key = RESEND_API_KEY
+
+        if isinstance(to_emails, str):
+            to_emails = [to_emails]
+
+        # Remove Alex own email from recipients
+        to_emails = [e for e in to_emails if e.lower() != ZOHO_EMAIL.lower()]
+
+        if not to_emails:
+            logger.warning("No recipients after filtering")
+            return False
+
         params = {
-            "from": f"Alex Rivera <{ZOHO_EMAIL}>",
-            "to": [to_email],
+            "from":    f"Alex Rivera <{ZOHO_EMAIL}>",
+            "to":      to_emails,
             "subject": subject,
-            "text": body
+            "text":    body,
+            "headers": {}
         }
+
+        # Thread headers for proper reply chain
+        if reply_to_msg_id:
+            params["headers"]["In-Reply-To"] = reply_to_msg_id
+            params["headers"]["References"]  = references or reply_to_msg_id
+
         resend.Emails.send(params)
-        logger.info(f"Email sent to {to_email}")
+        logger.info(f"Email sent to {to_emails}")
         return True
+
     except Exception as e:
         logger.error(f"Resend error: {e}")
         return False
@@ -214,7 +257,7 @@ From: {sender}
 Subject: {subject}
 Content: {body}
 
-Provide a brief internal assessment covering the following: the type of email (such as MAR, RFI, BOQ, Variation, Claim, NCR, or General), the key points in two or three sentences, the action required from the SCOPE team, the risk level as High, Medium or Low, and a recommended deadline for response."""
+Provide a brief internal assessment covering the type of email, key points in two or three sentences, the action required from the SCOPE team, the risk level as High, Medium or Low, and a recommended deadline for response."""
 
         else:
             prompt = f"""You have received the following email directly from a SCOPE Consulting team member. Write a complete professional reply.
@@ -259,9 +302,9 @@ def process_emails():
             mail.logout()
             return
 
-        recent = all_ids[-25:]
-        logger.info(f"Checking {len(recent)} recent emails")
+        recent    = all_ids[-50:]
         new_count = 0
+        logger.info(f"Checking {len(recent)} emails")
 
         for eid in reversed(recent):
             try:
@@ -282,11 +325,16 @@ def process_emails():
 
                 msg = email.message_from_bytes(raw)
 
-                sender   = safe_decode(msg.get("From"),    "").lower()
-                subject  = safe_decode(msg.get("Subject"), "No subject")
-                to_field = safe_decode(msg.get("To"),      "").lower()
-                cc_field = safe_decode(msg.get("CC"),      "").lower()
+                sender       = extract_email_address(msg.get("From", ""))
+                subject      = safe_decode(msg.get("Subject"), "No subject")
+                to_field     = safe_decode(msg.get("To"),      "").lower()
+                cc_field     = safe_decode(msg.get("CC"),      "").lower()
+                msg_id_hdr   = safe_decode(msg.get("Message-ID"), "")
+                references   = safe_decode(msg.get("References"), "")
+                to_addresses = extract_all_emails(msg.get("To",  ""))
+                cc_addresses = extract_all_emails(msg.get("CC",  ""))
 
+                # Skip Alex own sent emails
                 if ZOHO_EMAIL.lower() in sender:
                     save_processed_id(eid_str)
                     continue
@@ -307,7 +355,23 @@ def process_emails():
                     analysis = analyse_email(sender, subject, body, is_cc=False)
                     if analysis:
                         reply_sub = f"Re: {subject}" if not subject.startswith("Re:") else subject
-                        sent = send_email(sender, reply_sub, analysis)
+
+                        # Reply All — include sender + all To + all CC except Alex
+                        all_recipients = list(set(
+                            [sender] +
+                            [a for a in to_addresses  if a != ZOHO_EMAIL.lower()] +
+                            [a for a in cc_addresses  if a != ZOHO_EMAIL.lower()]
+                        ))
+
+                        new_references = f"{references} {msg_id_hdr}".strip() if references else msg_id_hdr
+
+                        sent = send_email(
+                            all_recipients,
+                            reply_sub,
+                            analysis,
+                            reply_to_msg_id=msg_id_hdr,
+                            references=new_references
+                        )
                         save_to_memory(
                             sender, subject, analysis[:300],
                             "Replied by Alex",
@@ -315,7 +379,7 @@ def process_emails():
                         )
 
                 elif is_direct and not is_internal:
-                    logger.info(f"Ignoring external: {sender}")
+                    logger.info(f"Ignoring external direct: {sender}")
 
                 elif is_cc_email:
                     analysis = analyse_email(sender, subject, body, is_cc=True)
@@ -349,17 +413,15 @@ def send_morning_report():
     logger.info("Sending morning report...")
     try:
         pending, closed = read_memory_for_report()
-        today    = datetime.now().strftime("%d %B %Y")
-        day_name = datetime.now().strftime("%A")
+        today = datetime.now().strftime("%d %B %Y")
 
         if pending:
-            report  = f"Dear Team,\n\n"
+            report  = "Dear Team,\n\n"
             report += f"Good morning. Please find below a summary of outstanding emails and open action items as of {today}.\n\n"
-
             for i, r in enumerate(pending[-15:], 1):
-                subj   = r.get("Subject") or r.get("Topic") or "No subject"
-                sender = r.get("Sender") or r.get("Project") or "Unknown"
-                date   = r.get("Date") or ""
+                subj   = r.get("Subject") or r.get("Topic")  or "No subject"
+                sender = r.get("Sender")  or r.get("Project") or "Unknown"
+                date   = r.get("Date")   or ""
                 status = r.get("Status") or ""
                 action = r.get("Action") or "Action required"
                 report += f"{i}. Subject: {subj}\n"
@@ -367,11 +429,9 @@ def send_morning_report():
                 report += f"   Date logged: {date}\n"
                 report += f"   Status: {status}\n"
                 report += f"   Action required: {action}\n\n"
-
             report += "Please review the above items and take the necessary action at your earliest convenience.\n\n"
-
         else:
-            report  = f"Dear Team,\n\n"
+            report  = "Dear Team,\n\n"
             report += f"Good morning. As of {today}, there are no outstanding emails or open action items requiring your attention.\n\n"
             report += "Should you have any queries or wish to submit documents for review, please send them directly to this address.\n\n"
 
@@ -381,13 +441,13 @@ def send_morning_report():
         report += "SCOPE Consulting MMC\n"
         report += "internal@scope-iq.io"
 
-        for recipient in REPORT_RECIPIENTS:
-            send_email(
-                recipient,
-                f"SCOPE IQ Daily Report — {today}",
-                report
-            )
-        logger.info("Morning report sent")
+        # Send ONE email to ALL team members together
+        send_email(
+            REPORT_RECIPIENTS,
+            f"SCOPE IQ Daily Report — {today}",
+            report
+        )
+        logger.info("Morning report sent to all team")
 
     except Exception as e:
         logger.error(f"Morning report error: {e}")
