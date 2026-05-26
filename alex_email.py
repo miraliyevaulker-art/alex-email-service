@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# Local cache for processed IDs — loaded from sheet on start
+# In-memory cache — rebuilt from sheet on every startup
 _processed_ids_cache = None
 
 SYSTEM_PROMPT = """You are Alex Rivera, Construction Expert at SCOPE Consulting MMC.
@@ -106,8 +106,8 @@ def get_sheet(tab="Sheet1"):
         return None
 
 
-def get_or_create_processed_sheet():
-    """Get or create Processed Emails tab in Google Sheet"""
+def get_processed_sheet():
+    """Get or create Processed Emails tab"""
     try:
         client = get_gspread_client()
         spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
@@ -115,8 +115,9 @@ def get_or_create_processed_sheet():
             return spreadsheet.worksheet("Processed Emails")
         except:
             sheet = spreadsheet.add_worksheet(
-                title="Processed Emails", rows=2000, cols=2)
-            sheet.append_row(["Email ID", "Processed At"])
+                title="Processed Emails", rows=5000, cols=2)
+            sheet.append_row(["Message ID", "Processed At"])
+            logger.info("Created Processed Emails tab")
             return sheet
     except Exception as e:
         logger.error(f"Processed sheet error: {e}")
@@ -124,45 +125,57 @@ def get_or_create_processed_sheet():
 
 
 def load_processed_ids():
-    """Load processed IDs from Google Sheet — survives redeploys"""
+    """Load all processed Message-IDs from Google Sheet"""
     global _processed_ids_cache
     if _processed_ids_cache is not None:
         return _processed_ids_cache
     try:
-        sheet = get_or_create_processed_sheet()
+        sheet = get_processed_sheet()
         if sheet:
-            records = sheet.get_all_values()
+            all_values = sheet.get_all_values()
             ids = set()
-            for row in records[1:]:  # Skip header
-                if row and row[0]:
-                    ids.add(str(row[0]))
+            for row in all_values[1:]:  # Skip header
+                if row and row[0] and row[0].strip():
+                    ids.add(row[0].strip())
             _processed_ids_cache = ids
-            logger.info(f"Loaded {len(ids)} processed email IDs from sheet")
+            logger.info(f"Loaded {len(ids)} processed IDs from sheet")
             return ids
     except Exception as e:
-        logger.error(f"Load processed IDs error: {e}")
+        logger.error(f"Load IDs error: {e}")
     _processed_ids_cache = set()
     return _processed_ids_cache
 
 
-def save_processed_id(msg_id):
-    """Save processed ID to Google Sheet permanently"""
+def mark_as_processed(msg_id):
+    """Mark Message-ID as processed — permanent across redeploys"""
     global _processed_ids_cache
+    if not msg_id:
+        return
+    msg_id = str(msg_id).strip()
     try:
-        msg_id_str = str(msg_id)
+        # Update cache immediately
         if _processed_ids_cache is not None:
-            if msg_id_str in _processed_ids_cache:
-                return
-            _processed_ids_cache.add(msg_id_str)
+            if msg_id in _processed_ids_cache:
+                return  # Already processed
+            _processed_ids_cache.add(msg_id)
 
-        sheet = get_or_create_processed_sheet()
+        # Save to sheet
+        sheet = get_processed_sheet()
         if sheet:
             sheet.append_row([
-                msg_id_str,
+                msg_id,
                 datetime.now().strftime("%d.%m.%Y %H:%M")
             ])
     except Exception as e:
-        logger.error(f"Save processed ID error: {e}")
+        logger.error(f"Mark processed error: {e}")
+
+
+def is_processed(msg_id):
+    """Check if Message-ID already processed"""
+    if not msg_id:
+        return False
+    ids = load_processed_ids()
+    return str(msg_id).strip() in ids
 
 
 def save_to_memory(sender, subject, summary, action, status="Open"):
@@ -338,6 +351,10 @@ Write a formal professional email reply. Default to English unless the email abo
 
 def process_emails():
     logger.info("Checking emails via IMAP...")
+
+    # Always reload from sheet to get latest processed IDs
+    global _processed_ids_cache
+    _processed_ids_cache = None
     processed_ids = load_processed_ids()
 
     try:
@@ -366,32 +383,38 @@ def process_emails():
             try:
                 eid_str = eid.decode() if isinstance(eid, bytes) else str(eid)
 
-                if eid_str in processed_ids:
-                    continue
-
                 typ, msg_data = mail.fetch(eid, "(RFC822)")
                 if typ != "OK" or not msg_data or not msg_data[0]:
-                    save_processed_id(eid_str)
                     continue
 
                 raw = msg_data[0][1]
                 if not raw:
-                    save_processed_id(eid_str)
                     continue
 
                 msg = email.message_from_bytes(raw)
+
+                # Use Message-ID as unique permanent identifier
+                msg_id_hdr = safe_decode(msg.get("Message-ID"), "").strip()
+
+                # Skip if already processed — check by Message-ID
+                if msg_id_hdr and is_processed(msg_id_hdr):
+                    continue
+
+                # Also skip by sequence ID if no Message-ID
+                if not msg_id_hdr and eid_str in processed_ids:
+                    continue
 
                 sender       = extract_email_address(msg.get("From", ""))
                 subject      = safe_decode(msg.get("Subject"), "No subject")
                 to_field     = safe_decode(msg.get("To"),      "").lower()
                 cc_field     = safe_decode(msg.get("CC"),      "").lower()
-                msg_id_hdr   = safe_decode(msg.get("Message-ID"), "")
                 references   = safe_decode(msg.get("References"), "")
                 to_addresses = extract_all_emails(msg.get("To",  ""))
                 cc_addresses = extract_all_emails(msg.get("CC",  ""))
 
+                # Skip Alex own sent emails
                 if ZOHO_EMAIL.lower() in sender:
-                    save_processed_id(eid_str)
+                    mark_as_processed(msg_id_hdr or eid_str)
                     continue
 
                 is_direct   = ZOHO_EMAIL.lower() in to_field
@@ -399,7 +422,7 @@ def process_emails():
                 is_internal = any(t in sender for t in SCOPE_TEAM_EMAILS)
 
                 if not is_direct and not is_cc_email:
-                    save_processed_id(eid_str)
+                    mark_as_processed(msg_id_hdr or eid_str)
                     continue
 
                 new_count += 1
@@ -445,14 +468,11 @@ def process_emails():
                             "Monitoring"
                         )
 
-                save_processed_id(eid_str)
+                # Mark as processed using Message-ID — permanent
+                mark_as_processed(msg_id_hdr or eid_str)
 
             except Exception as e:
                 logger.error(f"Email error: {e}")
-                try:
-                    save_processed_id(eid_str)
-                except:
-                    pass
                 continue
 
         mail.logout()
@@ -523,6 +543,7 @@ def main():
     logger.info(f"Report recipients: {REPORT_RECIPIENTS}")
 
     # Pre-load processed IDs on startup
+    logger.info("Loading processed email IDs from sheet...")
     load_processed_ids()
 
     schedule.every(5).minutes.do(process_emails)
