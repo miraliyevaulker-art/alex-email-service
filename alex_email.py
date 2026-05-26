@@ -212,14 +212,12 @@ def get_email_body(msg):
 
 
 def send_email(to_emails, subject, body, reply_to_msg_id=None, references=None):
-    """Send email via Resend API — supports Reply All"""
     try:
         resend.api_key = RESEND_API_KEY
 
         if isinstance(to_emails, str):
             to_emails = [to_emails]
 
-        # Remove Alex own email from recipients
         to_emails = [e for e in to_emails if e.lower() != ZOHO_EMAIL.lower()]
 
         if not to_emails:
@@ -234,7 +232,6 @@ def send_email(to_emails, subject, body, reply_to_msg_id=None, references=None):
             "headers": {}
         }
 
-        # Thread headers for proper reply chain
         if reply_to_msg_id:
             params["headers"]["In-Reply-To"] = reply_to_msg_id
             params["headers"]["References"]  = references or reply_to_msg_id
@@ -251,13 +248,27 @@ def send_email(to_emails, subject, body, reply_to_msg_id=None, references=None):
 def analyse_email(sender, subject, body, is_cc=False):
     try:
         if is_cc:
-            prompt = f"""You have been copied on the following email. Analyse it for internal SCOPE Consulting purposes only. Do not write a reply to the sender.
+            prompt = f"""You have been copied on the following email. Analyse it thoroughly for internal SCOPE Consulting purposes only. Do not write a reply to the sender.
 
 From: {sender}
 Subject: {subject}
 Content: {body}
 
-Provide a brief internal assessment covering the type of email, key points in two or three sentences, the action required from the SCOPE team, the risk level as High, Medium or Low, and a recommended deadline for response."""
+Provide a full internal assessment written in plain professional English covering the following points.
+
+First, state the email type such as MAR, RFI, BOQ, Variation, Claim, NCR, Instruction, or General Correspondence.
+
+Second, provide a summary of the key content in three to five sentences explaining what is being requested, submitted, or communicated.
+
+Third, identify any commercial, technical, contractual or programme implications and flag risks clearly.
+
+Fourth, state the specific actions required from the SCOPE team. For each action state clearly what needs to be done, who should do it, and by when.
+
+Fifth, state the risk level as High, Medium or Low with a brief justification.
+
+Sixth, recommend a response deadline based on contract requirements or urgency.
+
+Write in plain professional prose. No symbols, no bullet points, no checkmarks. Use numbered paragraphs."""
 
         else:
             prompt = f"""You have received the following email directly from a SCOPE Consulting team member. Write a complete professional reply.
@@ -334,7 +345,6 @@ def process_emails():
                 to_addresses = extract_all_emails(msg.get("To",  ""))
                 cc_addresses = extract_all_emails(msg.get("CC",  ""))
 
-                # Skip Alex own sent emails
                 if ZOHO_EMAIL.lower() in sender:
                     save_processed_id(eid_str)
                     continue
@@ -356,11 +366,10 @@ def process_emails():
                     if analysis:
                         reply_sub = f"Re: {subject}" if not subject.startswith("Re:") else subject
 
-                        # Reply All — include sender + all To + all CC except Alex
                         all_recipients = list(set(
                             [sender] +
-                            [a for a in to_addresses  if a != ZOHO_EMAIL.lower()] +
-                            [a for a in cc_addresses  if a != ZOHO_EMAIL.lower()]
+                            [a for a in to_addresses if a != ZOHO_EMAIL.lower()] +
+                            [a for a in cc_addresses if a != ZOHO_EMAIL.lower()]
                         ))
 
                         new_references = f"{references} {msg_id_hdr}".strip() if references else msg_id_hdr
@@ -373,7 +382,7 @@ def process_emails():
                             references=new_references
                         )
                         save_to_memory(
-                            sender, subject, analysis[:300],
+                            sender, subject, analysis[:400],
                             "Replied by Alex",
                             "Closed" if sent else "Open"
                         )
@@ -385,8 +394,9 @@ def process_emails():
                     analysis = analyse_email(sender, subject, body, is_cc=True)
                     if analysis:
                         save_to_memory(
-                            sender, subject, analysis[:300],
-                            "Logged — action required",
+                            sender, subject,
+                            analysis[:400],
+                            analysis[:500],
                             "Monitoring"
                         )
 
@@ -417,19 +427,28 @@ def send_morning_report():
 
         if pending:
             report  = "Dear Team,\n\n"
-            report += f"Good morning. Please find below a summary of outstanding emails and open action items as of {today}.\n\n"
+            report += f"Good morning. Please find below a detailed summary of outstanding emails and open action items as of {today}.\n\n"
+            report += "=" * 60 + "\n\n"
+
             for i, r in enumerate(pending[-15:], 1):
-                subj   = r.get("Subject") or r.get("Topic")  or "No subject"
-                sender = r.get("Sender")  or r.get("Project") or "Unknown"
-                date   = r.get("Date")   or ""
-                status = r.get("Status") or ""
-                action = r.get("Action") or "Action required"
-                report += f"{i}. Subject: {subj}\n"
-                report += f"   From: {sender}\n"
-                report += f"   Date logged: {date}\n"
-                report += f"   Status: {status}\n"
-                report += f"   Action required: {action}\n\n"
-            report += "Please review the above items and take the necessary action at your earliest convenience.\n\n"
+                subj    = r.get("Subject") or r.get("Topic")   or "No subject"
+                sender  = r.get("Sender")  or r.get("Project") or "Unknown"
+                date    = r.get("Date")    or "Not recorded"
+                status  = r.get("Status")  or "Open"
+                summary = r.get("Summary") or "No summary available"
+                action  = r.get("Action")  or "Review and action required"
+
+                report += f"Item {i}\n\n"
+                report += f"Subject: {subj}\n"
+                report += f"Date received: {date}\n"
+                report += f"From: {sender}\n"
+                report += f"Status: {status}\n\n"
+                report += f"Content summary:\n{summary}\n\n"
+                report += f"Action required:\n{action}\n\n"
+                report += "-" * 40 + "\n\n"
+
+            report += "Please review the above items and ensure the necessary actions are taken at your earliest convenience.\n\n"
+
         else:
             report  = "Dear Team,\n\n"
             report += f"Good morning. As of {today}, there are no outstanding emails or open action items requiring your attention.\n\n"
@@ -441,7 +460,6 @@ def send_morning_report():
         report += "SCOPE Consulting MMC\n"
         report += "internal@scope-iq.io"
 
-        # Send ONE email to ALL team members together
         send_email(
             REPORT_RECIPIENTS,
             f"SCOPE IQ Daily Report — {today}",
