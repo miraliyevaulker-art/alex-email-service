@@ -5,6 +5,7 @@ import imaplib
 import email
 import schedule
 import logging
+import io
 from email.header import decode_header
 from datetime import datetime
 from anthropic import Anthropic
@@ -42,8 +43,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
-
-# In-memory cache — rebuilt from sheet on every startup
 _processed_ids_cache = None
 
 SYSTEM_PROMPT = """You are Alex Rivera, Construction Expert at SCOPE Consulting MMC.
@@ -63,8 +62,17 @@ Use plain professional prose only. No bullet points, no symbols, no emojis, no c
 Paragraphs separated by blank lines.
 Begin with a formal salutation such as Dear Alishir, or Dear Team, as appropriate.
 End with a formal closing such as Kind regards or Yours sincerely.
-Be direct, confident and senior in tone. Never start with Certainly or Great question.
+Be direct, confident and senior in tone.
+Never say you will review later or that you need more time. Always analyse immediately and reply with full findings.
 Keep responses concise and actionable.
+
+CRITICAL — DOCUMENT ANALYSIS:
+When a BOQ, Smeta, Excel, or cost document is provided you must analyse it immediately and completely.
+Never promise to analyse later. Never say you will have findings in two days.
+Review every single position against Baku market rates right now and state clearly for each one whether the rate is within market range, above market, or below market.
+State the market range for each position.
+Flag missing items.
+Give total risk exposure at the end.
 
 SIGNATURE — always end every email with exactly this:
 
@@ -74,9 +82,9 @@ SCOPE Consulting MMC
 internal@scope-iq.io
 
 QA/QC RESPONSES:
-For MAR reviews state Approved, Approved with Comments, or Rejected in plain sentences with clear reasons referencing specification clauses.
-For BOQ reviews assess each position against Baku market rates in plain professional language.
-For contractual matters apply FIDIC or NEC4 as appropriate with formal contractual language.
+For MAR reviews state Approved, Approved with Comments, or Rejected in plain sentences.
+For BOQ reviews assess every position against Baku market rates immediately in plain professional language.
+For contractual matters apply FIDIC or NEC4 as appropriate.
 
 BAKU MARKET RATES FOR REFERENCE:
 Mechanical excavation 8 to 15 AZN per cubic metre, Manual excavation 60 to 90 AZN per cubic metre, Concrete C25/30 190 to 240 AZN per cubic metre, Reinforcement 1200 to 1500 AZN per tonne, Formwork 18 to 28 AZN per square metre, External brickwork 25 to 40 AZN per square metre, Plastering 16 to 24 AZN per square metre, Ceramic tiles 25 to 40 AZN per square metre, Gypsum partition 32 to 48 AZN per square metre, Paint 12 to 18 AZN per square metre, HVAC ductwork 45 to 75 AZN per square metre, Fan coil unit 350 to 600 AZN each, Lighting fixture 45 to 120 AZN each, Sprinkler system 45 to 75 AZN per square metre, Metal door 4500 to 6500 AZN each, Aluminium door 700 to 900 AZN each."""
@@ -107,7 +115,6 @@ def get_sheet(tab="Sheet1"):
 
 
 def get_processed_sheet():
-    """Get or create Processed Emails tab"""
     try:
         client = get_gspread_client()
         spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
@@ -117,7 +124,6 @@ def get_processed_sheet():
             sheet = spreadsheet.add_worksheet(
                 title="Processed Emails", rows=5000, cols=2)
             sheet.append_row(["Message ID", "Processed At"])
-            logger.info("Created Processed Emails tab")
             return sheet
     except Exception as e:
         logger.error(f"Processed sheet error: {e}")
@@ -125,7 +131,6 @@ def get_processed_sheet():
 
 
 def load_processed_ids():
-    """Load all processed Message-IDs from Google Sheet"""
     global _processed_ids_cache
     if _processed_ids_cache is not None:
         return _processed_ids_cache
@@ -134,11 +139,11 @@ def load_processed_ids():
         if sheet:
             all_values = sheet.get_all_values()
             ids = set()
-            for row in all_values[1:]:  # Skip header
+            for row in all_values[1:]:
                 if row and row[0] and row[0].strip():
                     ids.add(row[0].strip())
             _processed_ids_cache = ids
-            logger.info(f"Loaded {len(ids)} processed IDs from sheet")
+            logger.info(f"Loaded {len(ids)} processed IDs")
             return ids
     except Exception as e:
         logger.error(f"Load IDs error: {e}")
@@ -147,31 +152,23 @@ def load_processed_ids():
 
 
 def mark_as_processed(msg_id):
-    """Mark Message-ID as processed — permanent across redeploys"""
     global _processed_ids_cache
     if not msg_id:
         return
     msg_id = str(msg_id).strip()
     try:
-        # Update cache immediately
         if _processed_ids_cache is not None:
             if msg_id in _processed_ids_cache:
-                return  # Already processed
+                return
             _processed_ids_cache.add(msg_id)
-
-        # Save to sheet
         sheet = get_processed_sheet()
         if sheet:
-            sheet.append_row([
-                msg_id,
-                datetime.now().strftime("%d.%m.%Y %H:%M")
-            ])
+            sheet.append_row([msg_id, datetime.now().strftime("%d.%m.%Y %H:%M")])
     except Exception as e:
         logger.error(f"Mark processed error: {e}")
 
 
 def is_processed(msg_id):
-    """Check if Message-ID already processed"""
     if not msg_id:
         return False
     ids = load_processed_ids()
@@ -187,8 +184,6 @@ def save_to_memory(sender, subject, summary, action, status="Open"):
                 sender, subject, summary, action, status
             ])
             logger.info(f"Saved: {subject}")
-        else:
-            logger.error("Sheet not accessible")
     except Exception as e:
         logger.error(f"Save error: {e}")
 
@@ -246,6 +241,75 @@ def extract_all_emails(header_value):
     return addresses
 
 
+def extract_attachments(msg):
+    """Extract text content from email attachments"""
+    attachments = []
+    try:
+        for part in msg.walk():
+            content_disposition = str(part.get("Content-Disposition", ""))
+            content_type = part.get_content_type()
+            filename = part.get_filename()
+
+            if not filename and "attachment" not in content_disposition:
+                continue
+
+            filename = safe_decode(filename, "attachment")
+            payload  = part.get_payload(decode=True)
+            if not payload:
+                continue
+
+            ext = filename.lower().split(".")[-1] if "." in filename else ""
+
+            # Excel files
+            if ext in ["xlsx", "xls"]:
+                try:
+                    import openpyxl
+                    wb = openpyxl.load_workbook(io.BytesIO(payload))
+                    text = f"Excel file: {filename}\n"
+                    for sheet_name in wb.sheetnames[:3]:
+                        ws = wb[sheet_name]
+                        text += f"\nSheet: {sheet_name}\n"
+                        for row in ws.iter_rows(max_row=200, values_only=True):
+                            row_data = [str(c) for c in row if c is not None]
+                            if row_data:
+                                text += " | ".join(row_data) + "\n"
+                    attachments.append({"name": filename, "content": text[:6000]})
+                    logger.info(f"Extracted Excel: {filename}")
+                except Exception as e:
+                    logger.error(f"Excel extract error: {e}")
+
+            # PDF files
+            elif ext == "pdf":
+                try:
+                    import fitz
+                    doc = fitz.open(stream=payload, filetype="pdf")
+                    text = f"PDF file: {filename}\n"
+                    for page in doc:
+                        text += page.get_text()
+                    doc.close()
+                    attachments.append({"name": filename, "content": text[:4000]})
+                    logger.info(f"Extracted PDF: {filename}")
+                except Exception as e:
+                    logger.error(f"PDF extract error: {e}")
+
+            # Word files
+            elif ext in ["docx", "doc"]:
+                try:
+                    import docx
+                    document = docx.Document(io.BytesIO(payload))
+                    text = f"Word file: {filename}\n"
+                    text += "\n".join([p.text for p in document.paragraphs])
+                    attachments.append({"name": filename, "content": text[:4000]})
+                    logger.info(f"Extracted Word: {filename}")
+                except Exception as e:
+                    logger.error(f"Word extract error: {e}")
+
+    except Exception as e:
+        logger.error(f"Attachment extraction error: {e}")
+
+    return attachments
+
+
 def get_email_body(msg):
     body = ""
     try:
@@ -253,6 +317,8 @@ def get_email_body(msg):
             for part in msg.walk():
                 try:
                     if part.get_content_type() == "text/plain":
+                        if part.get_filename():
+                            continue
                         payload = part.get_payload(decode=True)
                         if payload:
                             charset = part.get_content_charset() or "utf-8"
@@ -266,7 +332,7 @@ def get_email_body(msg):
                 body = payload.decode(charset, errors="replace")
     except Exception as e:
         logger.error(f"Body error: {e}")
-    return body[:3000]
+    return body[:2000]
 
 
 def send_email(to_emails, subject, body, reply_to_msg_id=None, references=None):
@@ -279,7 +345,7 @@ def send_email(to_emails, subject, body, reply_to_msg_id=None, references=None):
         to_emails = [e for e in to_emails if e.lower() != ZOHO_EMAIL.lower()]
 
         if not to_emails:
-            logger.warning("No recipients after filtering")
+            logger.warning("No recipients")
             return False
 
         params = {
@@ -303,43 +369,65 @@ def send_email(to_emails, subject, body, reply_to_msg_id=None, references=None):
         return False
 
 
-def analyse_email(sender, subject, body, is_cc=False):
+def analyse_email(sender, subject, body, attachments=None, is_cc=False):
     try:
+        # Build full content including attachments
+        full_content = body
+
+        if attachments:
+            full_content += "\n\nATTACHMENTS:\n"
+            for att in attachments:
+                full_content += f"\n{att['name']}:\n{att['content']}\n"
+
         if is_cc:
             prompt = f"""You have been copied on the following email. Analyse it thoroughly for internal SCOPE Consulting purposes only. Do not write a reply to the sender.
 
 From: {sender}
 Subject: {subject}
-Content: {body}
+Content and attachments: {full_content}
 
-Provide a full internal assessment written in plain professional English covering the following points.
+Provide a full internal assessment in plain professional English:
 
-First, state the email type such as MAR, RFI, BOQ, Variation, Claim, NCR, Instruction, or General Correspondence.
+1. Email type (MAR, RFI, BOQ, Variation, Claim, NCR, Instruction, General Correspondence).
 
-Second, provide a summary of the key content in three to five sentences explaining what is being requested, submitted, or communicated.
+2. Summary of key content in three to five sentences.
 
-Third, identify any commercial, technical, contractual or programme implications and flag risks clearly.
+3. Commercial, technical, contractual or programme implications and risks.
 
-Fourth, state the specific actions required from the SCOPE team. For each action state clearly what needs to be done, who should do it, and by when.
+4. Specific actions required from SCOPE team — what needs to be done, who should do it, and by when.
 
-Fifth, state the risk level as High, Medium or Low with a brief justification.
+5. Risk level: High, Medium or Low with justification.
 
-Sixth, recommend a response deadline based on contract requirements or urgency.
+6. Recommended response deadline.
 
-Write in plain professional prose. No symbols, no bullet points, no checkmarks. Use numbered paragraphs."""
+No symbols, no bullet points. Numbered paragraphs only."""
 
         else:
-            prompt = f"""You have received the following email directly from a SCOPE Consulting team member. Write a complete professional reply.
+            if attachments:
+                prompt = f"""You have received the following email with attachments from a SCOPE Consulting team member. Analyse the attachments immediately and reply with your full findings now.
 
 From: {sender}
 Subject: {subject}
-Content: {body}
+Email body: {body}
 
-Write a formal professional email reply. Default to English unless the email above is written entirely in Azerbaijani. Follow the email writing style in your instructions exactly."""
+Attachments content:
+{chr(10).join([f"{a['name']}:{chr(10)}{a['content']}" for a in attachments])}
+
+Analyse all attachments immediately. For BOQ or cost documents review every position against Baku market rates right now. For each position state whether the rate is within market range, above market, or below market, and give the market range. Flag missing items. Give total risk exposure at the end.
+
+Write a complete formal professional email reply with your full analysis included. Do not promise to analyse later. Analyse now and include all findings in this reply."""
+            else:
+                prompt = f"""You have received the following email directly from a SCOPE Consulting team member. Write a complete professional reply.
+
+From: {sender}
+Subject: {subject}
+Content: {full_content}
+
+Write a formal professional email reply. Default to English unless the email above is written entirely in Azerbaijani."""
 
         response = anthropic_client.messages.create(
             model=MODEL,
-            max_tokens=1500,
+            max_tokens=2000,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -352,7 +440,6 @@ Write a formal professional email reply. Default to English unless the email abo
 def process_emails():
     logger.info("Checking emails via IMAP...")
 
-    # Always reload from sheet to get latest processed IDs
     global _processed_ids_cache
     _processed_ids_cache = None
     processed_ids = load_processed_ids()
@@ -381,8 +468,7 @@ def process_emails():
 
         for eid in reversed(recent):
             try:
-                eid_str = eid.decode() if isinstance(eid, bytes) else str(eid)
-
+                eid_str    = eid.decode() if isinstance(eid, bytes) else str(eid)
                 typ, msg_data = mail.fetch(eid, "(RFC822)")
                 if typ != "OK" or not msg_data or not msg_data[0]:
                     continue
@@ -391,16 +477,12 @@ def process_emails():
                 if not raw:
                     continue
 
-                msg = email.message_from_bytes(raw)
-
-                # Use Message-ID as unique permanent identifier
+                msg        = email.message_from_bytes(raw)
                 msg_id_hdr = safe_decode(msg.get("Message-ID"), "").strip()
 
-                # Skip if already processed — check by Message-ID
+                # Skip if already processed
                 if msg_id_hdr and is_processed(msg_id_hdr):
                     continue
-
-                # Also skip by sequence ID if no Message-ID
                 if not msg_id_hdr and eid_str in processed_ids:
                     continue
 
@@ -412,7 +494,6 @@ def process_emails():
                 to_addresses = extract_all_emails(msg.get("To",  ""))
                 cc_addresses = extract_all_emails(msg.get("CC",  ""))
 
-                # Skip Alex own sent emails
                 if ZOHO_EMAIL.lower() in sender:
                     mark_as_processed(msg_id_hdr or eid_str)
                     continue
@@ -426,11 +507,20 @@ def process_emails():
                     continue
 
                 new_count += 1
-                body = get_email_body(msg)
+                body        = get_email_body(msg)
+                attachments = extract_attachments(msg)
+
+                if attachments:
+                    logger.info(f"Found {len(attachments)} attachments in email from {sender}")
+
                 logger.info(f"Processing: {sender} | {subject}")
 
                 if is_direct and is_internal:
-                    analysis = analyse_email(sender, subject, body, is_cc=False)
+                    analysis = analyse_email(
+                        sender, subject, body,
+                        attachments=attachments,
+                        is_cc=False
+                    )
                     if analysis:
                         reply_sub = f"Re: {subject}" if not subject.startswith("Re:") else subject
 
@@ -459,7 +549,11 @@ def process_emails():
                     logger.info(f"Ignoring external direct: {sender}")
 
                 elif is_cc_email:
-                    analysis = analyse_email(sender, subject, body, is_cc=True)
+                    analysis = analyse_email(
+                        sender, subject, body,
+                        attachments=attachments,
+                        is_cc=True
+                    )
                     if analysis:
                         save_to_memory(
                             sender, subject,
@@ -468,7 +562,6 @@ def process_emails():
                             "Monitoring"
                         )
 
-                # Mark as processed using Message-ID — permanent
                 mark_as_processed(msg_id_hdr or eid_str)
 
             except Exception as e:
@@ -542,8 +635,6 @@ def main():
     logger.info(f"Authorised team: {SCOPE_TEAM_EMAILS}")
     logger.info(f"Report recipients: {REPORT_RECIPIENTS}")
 
-    # Pre-load processed IDs on startup
-    logger.info("Loading processed email IDs from sheet...")
     load_processed_ids()
 
     schedule.every(5).minutes.do(process_emails)
