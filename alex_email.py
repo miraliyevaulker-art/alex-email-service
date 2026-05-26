@@ -63,16 +63,22 @@ Paragraphs separated by blank lines.
 Begin with a formal salutation such as Dear Alishir, or Dear Team, as appropriate.
 End with a formal closing such as Kind regards or Yours sincerely.
 Be direct, confident and senior in tone.
-Never say you will review later or that you need more time. Always analyse immediately and reply with full findings.
 Keep responses concise and actionable.
 
+RESPONSE TIME - CRITICAL:
+Never say you will review later or that you need more time.
+Never say within the working day, within two working days, or any future time commitment.
+Never say you will have findings ready later.
+Always analyse immediately and include full findings in your reply right now.
+If attachments are missing, request them and state you will reply within minutes of receiving the files. Not hours. Not days. Minutes.
+
 CRITICAL — DOCUMENT ANALYSIS:
-When a BOQ, Smeta, Excel, or cost document is provided you must analyse it immediately and completely.
-Never promise to analyse later. Never say you will have findings in two days.
-Review every single position against Baku market rates right now and state clearly for each one whether the rate is within market range, above market, or below market.
+When a BOQ, Smeta, Excel, or any cost document is provided you must analyse it immediately and completely in your reply.
+Review every single position against Baku market rates and state clearly whether each rate is within market range, above market, or below market.
 State the market range for each position.
-Flag missing items.
+Flag missing items and scope gaps.
 Give total risk exposure at the end.
+Do this in the same reply. Do not defer.
 
 SIGNATURE — always end every email with exactly this:
 
@@ -83,7 +89,7 @@ internal@scope-iq.io
 
 QA/QC RESPONSES:
 For MAR reviews state Approved, Approved with Comments, or Rejected in plain sentences.
-For BOQ reviews assess every position against Baku market rates immediately in plain professional language.
+For BOQ reviews assess every position against Baku market rates immediately.
 For contractual matters apply FIDIC or NEC4 as appropriate.
 
 BAKU MARKET RATES FOR REFERENCE:
@@ -242,29 +248,23 @@ def extract_all_emails(header_value):
 
 
 def extract_attachments(msg):
-    """Extract text content from email attachments"""
     attachments = []
     try:
         for part in msg.walk():
             content_disposition = str(part.get("Content-Disposition", ""))
-            content_type = part.get_content_type()
             filename = part.get_filename()
-
             if not filename and "attachment" not in content_disposition:
                 continue
-
             filename = safe_decode(filename, "attachment")
             payload  = part.get_payload(decode=True)
             if not payload:
                 continue
-
             ext = filename.lower().split(".")[-1] if "." in filename else ""
 
-            # Excel files
             if ext in ["xlsx", "xls"]:
                 try:
                     import openpyxl
-                    wb = openpyxl.load_workbook(io.BytesIO(payload))
+                    wb   = openpyxl.load_workbook(io.BytesIO(payload))
                     text = f"Excel file: {filename}\n"
                     for sheet_name in wb.sheetnames[:3]:
                         ws = wb[sheet_name]
@@ -276,13 +276,12 @@ def extract_attachments(msg):
                     attachments.append({"name": filename, "content": text[:6000]})
                     logger.info(f"Extracted Excel: {filename}")
                 except Exception as e:
-                    logger.error(f"Excel extract error: {e}")
+                    logger.error(f"Excel error: {e}")
 
-            # PDF files
             elif ext == "pdf":
                 try:
                     import fitz
-                    doc = fitz.open(stream=payload, filetype="pdf")
+                    doc  = fitz.open(stream=payload, filetype="pdf")
                     text = f"PDF file: {filename}\n"
                     for page in doc:
                         text += page.get_text()
@@ -290,23 +289,21 @@ def extract_attachments(msg):
                     attachments.append({"name": filename, "content": text[:4000]})
                     logger.info(f"Extracted PDF: {filename}")
                 except Exception as e:
-                    logger.error(f"PDF extract error: {e}")
+                    logger.error(f"PDF error: {e}")
 
-            # Word files
             elif ext in ["docx", "doc"]:
                 try:
                     import docx
                     document = docx.Document(io.BytesIO(payload))
-                    text = f"Word file: {filename}\n"
-                    text += "\n".join([p.text for p in document.paragraphs])
+                    text     = f"Word file: {filename}\n"
+                    text    += "\n".join([p.text for p in document.paragraphs])
                     attachments.append({"name": filename, "content": text[:4000]})
                     logger.info(f"Extracted Word: {filename}")
                 except Exception as e:
-                    logger.error(f"Word extract error: {e}")
+                    logger.error(f"Word error: {e}")
 
     except Exception as e:
-        logger.error(f"Attachment extraction error: {e}")
-
+        logger.error(f"Attachment error: {e}")
     return attachments
 
 
@@ -322,14 +319,14 @@ def get_email_body(msg):
                         payload = part.get_payload(decode=True)
                         if payload:
                             charset = part.get_content_charset() or "utf-8"
-                            body += payload.decode(charset, errors="replace")
+                            body   += payload.decode(charset, errors="replace")
                 except:
                     continue
         else:
             payload = msg.get_payload(decode=True)
             if payload:
                 charset = msg.get_content_charset() or "utf-8"
-                body = payload.decode(charset, errors="replace")
+                body    = payload.decode(charset, errors="replace")
     except Exception as e:
         logger.error(f"Body error: {e}")
     return body[:2000]
@@ -338,16 +335,12 @@ def get_email_body(msg):
 def send_email(to_emails, subject, body, reply_to_msg_id=None, references=None):
     try:
         resend.api_key = RESEND_API_KEY
-
         if isinstance(to_emails, str):
             to_emails = [to_emails]
-
         to_emails = [e for e in to_emails if e.lower() != ZOHO_EMAIL.lower()]
-
         if not to_emails:
             logger.warning("No recipients")
             return False
-
         params = {
             "from":    f"Alex Rivera <{ZOHO_EMAIL}>",
             "to":      to_emails,
@@ -355,15 +348,12 @@ def send_email(to_emails, subject, body, reply_to_msg_id=None, references=None):
             "text":    body,
             "headers": {}
         }
-
         if reply_to_msg_id:
             params["headers"]["In-Reply-To"] = reply_to_msg_id
             params["headers"]["References"]  = references or reply_to_msg_id
-
         resend.Emails.send(params)
         logger.info(f"Email sent to {to_emails}")
         return True
-
     except Exception as e:
         logger.error(f"Resend error: {e}")
         return False
@@ -371,9 +361,7 @@ def send_email(to_emails, subject, body, reply_to_msg_id=None, references=None):
 
 def analyse_email(sender, subject, body, attachments=None, is_cc=False):
     try:
-        # Build full content including attachments
         full_content = body
-
         if attachments:
             full_content += "\n\nATTACHMENTS:\n"
             for att in attachments:
@@ -386,44 +374,40 @@ From: {sender}
 Subject: {subject}
 Content and attachments: {full_content}
 
-Provide a full internal assessment in plain professional English:
+Provide a full internal assessment in plain professional English.
 
-1. Email type (MAR, RFI, BOQ, Variation, Claim, NCR, Instruction, General Correspondence).
-
+1. Email type.
 2. Summary of key content in three to five sentences.
-
 3. Commercial, technical, contractual or programme implications and risks.
-
-4. Specific actions required from SCOPE team — what needs to be done, who should do it, and by when.
-
+4. Specific actions required from SCOPE team — what, who, and by when.
 5. Risk level: High, Medium or Low with justification.
-
 6. Recommended response deadline.
 
-No symbols, no bullet points. Numbered paragraphs only."""
+No symbols. No bullet points. Numbered paragraphs only."""
 
         else:
             if attachments:
-                prompt = f"""You have received the following email with attachments from a SCOPE Consulting team member. Analyse the attachments immediately and reply with your full findings now.
+                prompt = f"""You have received the following email with attachments from a SCOPE Consulting team member.
 
 From: {sender}
 Subject: {subject}
 Email body: {body}
 
-Attachments content:
+Attachments:
 {chr(10).join([f"{a['name']}:{chr(10)}{a['content']}" for a in attachments])}
 
-Analyse all attachments immediately. For BOQ or cost documents review every position against Baku market rates right now. For each position state whether the rate is within market range, above market, or below market, and give the market range. Flag missing items. Give total risk exposure at the end.
-
-Write a complete formal professional email reply with your full analysis included. Do not promise to analyse later. Analyse now and include all findings in this reply."""
+Analyse all attachments immediately and include your full findings in this reply now.
+For BOQ or cost documents review every position against Baku market rates. For each position state whether the rate is within market range, above market, or below market, and give the market range.
+Flag missing items and give total risk exposure at the end.
+Write a complete formal professional email reply with all analysis included."""
             else:
-                prompt = f"""You have received the following email directly from a SCOPE Consulting team member. Write a complete professional reply.
+                prompt = f"""You have received the following email from a SCOPE Consulting team member. Write a complete professional reply.
 
 From: {sender}
 Subject: {subject}
 Content: {full_content}
 
-Write a formal professional email reply. Default to English unless the email above is written entirely in Azerbaijani."""
+Write a formal professional email reply in English unless the email is entirely in Azerbaijani."""
 
         response = anthropic_client.messages.create(
             model=MODEL,
@@ -468,11 +452,10 @@ def process_emails():
 
         for eid in reversed(recent):
             try:
-                eid_str    = eid.decode() if isinstance(eid, bytes) else str(eid)
+                eid_str       = eid.decode() if isinstance(eid, bytes) else str(eid)
                 typ, msg_data = mail.fetch(eid, "(RFC822)")
                 if typ != "OK" or not msg_data or not msg_data[0]:
                     continue
-
                 raw = msg_data[0][1]
                 if not raw:
                     continue
@@ -480,7 +463,6 @@ def process_emails():
                 msg        = email.message_from_bytes(raw)
                 msg_id_hdr = safe_decode(msg.get("Message-ID"), "").strip()
 
-                # Skip if already processed
                 if msg_id_hdr and is_processed(msg_id_hdr):
                     continue
                 if not msg_id_hdr and eid_str in processed_ids:
@@ -506,36 +488,29 @@ def process_emails():
                     mark_as_processed(msg_id_hdr or eid_str)
                     continue
 
-                new_count += 1
+                new_count  += 1
                 body        = get_email_body(msg)
                 attachments = extract_attachments(msg)
 
                 if attachments:
-                    logger.info(f"Found {len(attachments)} attachments in email from {sender}")
+                    logger.info(f"Found {len(attachments)} attachments from {sender}")
 
                 logger.info(f"Processing: {sender} | {subject}")
 
                 if is_direct and is_internal:
                     analysis = analyse_email(
                         sender, subject, body,
-                        attachments=attachments,
-                        is_cc=False
-                    )
+                        attachments=attachments, is_cc=False)
                     if analysis:
                         reply_sub = f"Re: {subject}" if not subject.startswith("Re:") else subject
-
                         all_recipients = list(set(
                             [sender] +
                             [a for a in to_addresses if a != ZOHO_EMAIL.lower()] +
                             [a for a in cc_addresses if a != ZOHO_EMAIL.lower()]
                         ))
-
                         new_references = f"{references} {msg_id_hdr}".strip() if references else msg_id_hdr
-
                         sent = send_email(
-                            all_recipients,
-                            reply_sub,
-                            analysis,
+                            all_recipients, reply_sub, analysis,
                             reply_to_msg_id=msg_id_hdr,
                             references=new_references
                         )
@@ -551,14 +526,11 @@ def process_emails():
                 elif is_cc_email:
                     analysis = analyse_email(
                         sender, subject, body,
-                        attachments=attachments,
-                        is_cc=True
-                    )
+                        attachments=attachments, is_cc=True)
                     if analysis:
                         save_to_memory(
                             sender, subject,
-                            analysis[:400],
-                            analysis[:500],
+                            analysis[:400], analysis[:500],
                             "Monitoring"
                         )
 
@@ -587,7 +559,6 @@ def send_morning_report():
             report  = "Dear Team,\n\n"
             report += f"Good morning. Please find below a detailed summary of outstanding emails and open action items as of {today}.\n\n"
             report += "=" * 60 + "\n\n"
-
             for i, r in enumerate(pending[-15:], 1):
                 subj    = r.get("Subject") or r.get("Topic")   or "No subject"
                 sender  = r.get("Sender")  or r.get("Project") or "Unknown"
@@ -595,7 +566,6 @@ def send_morning_report():
                 status  = r.get("Status")  or "Open"
                 summary = r.get("Summary") or "No summary available"
                 action  = r.get("Action")  or "Review and action required"
-
                 report += f"Item {i}\n\n"
                 report += f"Subject: {subj}\n"
                 report += f"Date received: {date}\n"
@@ -604,9 +574,7 @@ def send_morning_report():
                 report += f"Content summary:\n{summary}\n\n"
                 report += f"Action required:\n{action}\n\n"
                 report += "-" * 40 + "\n\n"
-
             report += "Please review the above items and ensure the necessary actions are taken at your earliest convenience.\n\n"
-
         else:
             report  = "Dear Team,\n\n"
             report += f"Good morning. As of {today}, there are no outstanding emails or open action items requiring your attention.\n\n"
