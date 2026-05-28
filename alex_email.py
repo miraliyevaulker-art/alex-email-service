@@ -42,7 +42,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+anthropic_client     = Anthropic(api_key=ANTHROPIC_API_KEY)
 _processed_ids_cache = None
 
 SYSTEM_PROMPT = """You are Alex Rivera, Construction Expert at SCOPE Consulting MMC.
@@ -68,17 +68,17 @@ Keep responses concise and actionable.
 RESPONSE TIME - CRITICAL:
 Never say you will review later or that you need more time.
 Never say within the working day, within two working days, or any future time commitment.
-Never say you will have findings ready later.
 Always analyse immediately and include full findings in your reply right now.
-If attachments are missing, request them and state you will reply within minutes of receiving the files. Not hours. Not days. Minutes.
+If attachments are missing, request them and state you will reply within minutes of receiving the files.
 
-CRITICAL — DOCUMENT ANALYSIS:
-When a BOQ, Smeta, Excel, or any cost document is provided you must analyse it immediately and completely in your reply.
-Review every single position against Baku market rates and state clearly whether each rate is within market range, above market, or below market.
-State the market range for each position.
-Flag missing items and scope gaps.
-Give total risk exposure at the end.
-Do this in the same reply. Do not defer.
+DOCUMENT ANALYSIS - CRITICAL:
+When any BOQ, Smeta, Excel, cost schedule, or pricing document is provided you must analyse every single sheet and every single position immediately.
+Do not skip any sheet. Do not skip any section. Do not skip mezzanine, fit-out, MEP, external works, or any other discipline.
+Review every position across all sheets against Baku market rates.
+For each position state whether the rate is within market range, above market, or below market and give the Baku market range.
+Flag all missing items and scope gaps across all sheets.
+Give total risk exposure at the end covering all sheets combined.
+Never acknowledge gaps after the fact. Analyse everything in the first reply.
 
 SIGNATURE — always end every email with exactly this:
 
@@ -87,13 +87,12 @@ Construction Expert
 SCOPE Consulting MMC
 internal@scope-iq.io
 
-QA/QC RESPONSES:
-For MAR reviews state Approved, Approved with Comments, or Rejected in plain sentences.
-For BOQ reviews assess every position against Baku market rates immediately.
-For contractual matters apply FIDIC or NEC4 as appropriate.
+QA/QC: MAR — Approved, Approved with Comments, or Rejected in plain sentences.
+BOQ: Every position across every sheet analysed immediately against Baku market rates.
+FIDIC/NEC4: Contractually correct responses always.
 
-BAKU MARKET RATES FOR REFERENCE:
-Mechanical excavation 8 to 15 AZN per cubic metre, Manual excavation 60 to 90 AZN per cubic metre, Concrete C25/30 190 to 240 AZN per cubic metre, Reinforcement 1200 to 1500 AZN per tonne, Formwork 18 to 28 AZN per square metre, External brickwork 25 to 40 AZN per square metre, Plastering 16 to 24 AZN per square metre, Ceramic tiles 25 to 40 AZN per square metre, Gypsum partition 32 to 48 AZN per square metre, Paint 12 to 18 AZN per square metre, HVAC ductwork 45 to 75 AZN per square metre, Fan coil unit 350 to 600 AZN each, Lighting fixture 45 to 120 AZN each, Sprinkler system 45 to 75 AZN per square metre, Metal door 4500 to 6500 AZN each, Aluminium door 700 to 900 AZN each."""
+BAKU MARKET RATES:
+Mechanical excavation 8 to 15 AZN per cubic metre, Manual excavation 60 to 90 AZN per cubic metre, Concrete C25/30 190 to 240 AZN per cubic metre, Reinforcement 1200 to 1500 AZN per tonne, Formwork 18 to 28 AZN per square metre, External brickwork 25 to 40 AZN per square metre, Internal brickwork 20 to 32 AZN per square metre, Plastering 16 to 24 AZN per square metre, Paint 12 to 18 AZN per square metre, Ceramic tiles 25 to 40 AZN per square metre, Premium tiles 45 to 80 AZN per square metre, Gypsum partition 32 to 48 AZN per square metre, Armstrong ceiling 28 to 42 AZN per square metre, Raised access floor 55 to 85 AZN per square metre, Epoxy floor 35 to 55 AZN per square metre, Carpet tiles 40 to 70 AZN per square metre, Aluminium glazing 180 to 280 AZN per square metre, Timber door 350 to 550 AZN each, Fire door 600 to 1200 AZN each, Metal door 4500 to 6500 AZN each, Aluminium door 700 to 900 AZN each, HVAC ductwork 45 to 75 AZN per square metre, Fan coil unit 350 to 600 AZN each, Chiller 120 to 200 AZN per kW, Plumbing pipework 25 to 55 AZN per metre, Sanitary point 180 to 350 AZN per point, Cable tray 35 to 65 AZN per metre, LV cable 8 to 25 AZN per metre, Distribution board 800 to 3500 AZN each, Lighting fixture 45 to 120 AZN each, Emergency lighting 80 to 180 AZN each, Fire alarm 35 to 65 AZN per square metre, Sprinkler system 45 to 75 AZN per square metre, Access control 800 to 2500 AZN per door, CCTV 250 to 600 AZN per camera, Concrete paving 35 to 55 AZN per square metre, Natural stone paving 85 to 150 AZN per square metre, Soft landscape 25 to 55 AZN per square metre, Site fencing 45 to 120 AZN per metre, Passenger lift 45000 to 80000 AZN each, Freight lift 60000 to 120000 AZN each."""
 
 
 def get_gspread_client():
@@ -122,7 +121,7 @@ def get_sheet(tab="Sheet1"):
 
 def get_processed_sheet():
     try:
-        client = get_gspread_client()
+        client      = get_gspread_client()
         spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
         try:
             return spreadsheet.worksheet("Processed Emails")
@@ -248,6 +247,7 @@ def extract_all_emails(header_value):
 
 
 def extract_attachments(msg):
+    """Extract ALL content from ALL sheets of all attachments"""
     attachments = []
     try:
         for part in msg.walk():
@@ -266,15 +266,28 @@ def extract_attachments(msg):
                     import openpyxl
                     wb   = openpyxl.load_workbook(io.BytesIO(payload))
                     text = f"Excel file: {filename}\n"
-                    for sheet_name in wb.sheetnames[:3]:
-                        ws = wb[sheet_name]
-                        text += f"\nSheet: {sheet_name}\n"
-                        for row in ws.iter_rows(max_row=200, values_only=True):
+                    text += f"Total sheets: {len(wb.sheetnames)}\n"
+                    text += f"Sheet names: {', '.join(wb.sheetnames)}\n\n"
+
+                    # Read ALL sheets — no limit
+                    for sheet_name in wb.sheetnames:
+                        ws   = wb[sheet_name]
+                        text += f"\n{'='*40}\n"
+                        text += f"SHEET: {sheet_name}\n"
+                        text += f"{'='*40}\n"
+                        row_count = 0
+                        for row in ws.iter_rows(max_row=500, values_only=True):
                             row_data = [str(c) for c in row if c is not None]
                             if row_data:
                                 text += " | ".join(row_data) + "\n"
-                    attachments.append({"name": filename, "content": text[:6000]})
-                    logger.info(f"Extracted Excel: {filename}")
+                                row_count += 1
+                        text += f"(Total rows in sheet: {row_count})\n"
+
+                    attachments.append({
+                        "name":    filename,
+                        "content": text[:15000]  # Increased limit
+                    })
+                    logger.info(f"Extracted Excel: {filename} — {len(wb.sheetnames)} sheets")
                 except Exception as e:
                     logger.error(f"Excel error: {e}")
 
@@ -286,7 +299,7 @@ def extract_attachments(msg):
                     for page in doc:
                         text += page.get_text()
                     doc.close()
-                    attachments.append({"name": filename, "content": text[:4000]})
+                    attachments.append({"name": filename, "content": text[:5000]})
                     logger.info(f"Extracted PDF: {filename}")
                 except Exception as e:
                     logger.error(f"PDF error: {e}")
@@ -297,7 +310,7 @@ def extract_attachments(msg):
                     document = docx.Document(io.BytesIO(payload))
                     text     = f"Word file: {filename}\n"
                     text    += "\n".join([p.text for p in document.paragraphs])
-                    attachments.append({"name": filename, "content": text[:4000]})
+                    attachments.append({"name": filename, "content": text[:5000]})
                     logger.info(f"Extracted Word: {filename}")
                 except Exception as e:
                     logger.error(f"Word error: {e}")
@@ -368,50 +381,55 @@ def analyse_email(sender, subject, body, attachments=None, is_cc=False):
                 full_content += f"\n{att['name']}:\n{att['content']}\n"
 
         if is_cc:
-            prompt = f"""You have been copied on the following email. Analyse it thoroughly for internal SCOPE Consulting purposes only. Do not write a reply to the sender.
+            prompt = f"""You have been copied on the following email. Analyse thoroughly for internal SCOPE Consulting purposes only. Do not reply to sender.
 
 From: {sender}
 Subject: {subject}
-Content and attachments: {full_content}
+Content: {full_content}
 
-Provide a full internal assessment in plain professional English.
+Full internal assessment in plain professional English:
 
 1. Email type.
-2. Summary of key content in three to five sentences.
-3. Commercial, technical, contractual or programme implications and risks.
-4. Specific actions required from SCOPE team — what, who, and by when.
-5. Risk level: High, Medium or Low with justification.
+2. Summary in three to five sentences.
+3. Commercial, technical, contractual or programme implications.
+4. Specific actions required from SCOPE team — what, who, by when.
+5. Risk level: High, Medium or Low.
 6. Recommended response deadline.
 
-No symbols. No bullet points. Numbered paragraphs only."""
+No symbols. No bullet points. Numbered paragraphs."""
 
         else:
             if attachments:
+                att_content = chr(10).join([
+                    f"{a['name']}:\n{a['content']}" for a in attachments
+                ])
                 prompt = f"""You have received the following email with attachments from a SCOPE Consulting team member.
 
 From: {sender}
 Subject: {subject}
 Email body: {body}
 
-Attachments:
-{chr(10).join([f"{a['name']}:{chr(10)}{a['content']}" for a in attachments])}
+FULL ATTACHMENT CONTENT — ALL SHEETS:
+{att_content}
 
-Analyse all attachments immediately and include your full findings in this reply now.
-For BOQ or cost documents review every position against Baku market rates. For each position state whether the rate is within market range, above market, or below market, and give the market range.
-Flag missing items and give total risk exposure at the end.
-Write a complete formal professional email reply with all analysis included."""
+You must analyse every single sheet and every single position in all attachments right now.
+Do not skip any sheet. Do not skip mezzanine, fit-out, MEP, civil, structural, external works, or any other discipline.
+For every position state whether the rate is within Baku market range, above market, or below market. Give the market range for each.
+Flag all missing items and scope gaps across all sheets.
+Give combined total risk exposure at the end.
+Write a complete formal professional email reply with your full analysis included now."""
             else:
-                prompt = f"""You have received the following email from a SCOPE Consulting team member. Write a complete professional reply.
+                prompt = f"""You have received the following email from a SCOPE Consulting team member.
 
 From: {sender}
 Subject: {subject}
 Content: {full_content}
 
-Write a formal professional email reply in English unless the email is entirely in Azerbaijani."""
+Write a complete formal professional email reply in English unless the email is entirely in Azerbaijani."""
 
         response = anthropic_client.messages.create(
             model=MODEL,
-            max_tokens=2000,
+            max_tokens=3000,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}]
         )
