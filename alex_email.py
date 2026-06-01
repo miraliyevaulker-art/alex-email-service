@@ -70,16 +70,15 @@ RESPONSE TIME - CRITICAL:
 Never say you will review later or that you need more time.
 Never say within the working day, within two working days, or any future time commitment.
 Always analyse immediately and include full findings in your reply right now.
-If attachments are missing, request them and state you will reply within minutes of receiving the files.
+If attachments are missing but you have previously received files from this sender, use those files to answer the question. Never ask for files that were already sent.
+Only request files if you have genuinely never received any from this sender before.
 
 DOCUMENT ANALYSIS - CRITICAL:
-When any BOQ, Smeta, Excel, cost schedule, or pricing document is provided you must analyse every single sheet and every single position immediately.
-Do not skip any sheet. Do not skip mezzanine, fit-out, MEP, civil, structural, external works, or any other discipline.
-Review every position across all sheets against Baku market rates.
-For each position state whether the rate is within market range, above market, or below market and give the Baku market range.
+When any BOQ, Smeta, Excel, cost schedule, or pricing document is provided analyse every single sheet and every single position immediately.
+Do not skip any sheet. Do not skip mezzanine, fit-out, MEP, civil, structural, external works, or any discipline.
+For every position state whether the rate is within market range, above market, or below market and give the Baku market range.
 Flag all missing items and scope gaps across all sheets.
-Give total risk exposure at the end covering all sheets combined.
-Never acknowledge gaps after the fact. Analyse everything in the first reply.
+Give total risk exposure at the end.
 
 SIGNATURE — always end every email with exactly this:
 
@@ -87,10 +86,6 @@ Alex Rivera
 Construction Expert
 SCOPE Consulting MMC
 internal@scope-iq.io
-
-QA/QC: MAR — Approved, Approved with Comments, or Rejected in plain sentences.
-BOQ: Every position across every sheet analysed immediately against Baku market rates.
-FIDIC/NEC4: Contractually correct responses always.
 
 BAKU MARKET RATES:
 Mechanical excavation 8 to 15 AZN per cubic metre, Manual excavation 60 to 90 AZN per cubic metre, Concrete C25/30 190 to 240 AZN per cubic metre, Reinforcement 1200 to 1500 AZN per tonne, Formwork 18 to 28 AZN per square metre, External brickwork 25 to 40 AZN per square metre, Internal brickwork 20 to 32 AZN per square metre, Plastering 16 to 24 AZN per square metre, Paint 12 to 18 AZN per square metre, Ceramic tiles 25 to 40 AZN per square metre, Premium tiles 45 to 80 AZN per square metre, Gypsum partition 32 to 48 AZN per square metre, Armstrong ceiling 28 to 42 AZN per square metre, Raised access floor 55 to 85 AZN per square metre, Epoxy floor 35 to 55 AZN per square metre, Carpet tiles 40 to 70 AZN per square metre, Aluminium glazing 180 to 280 AZN per square metre, Timber door 350 to 550 AZN each, Fire door 600 to 1200 AZN each, Metal door 4500 to 6500 AZN each, Aluminium door 700 to 900 AZN each, HVAC ductwork 45 to 75 AZN per square metre, Fan coil unit 350 to 600 AZN each, Chiller 120 to 200 AZN per kW, Plumbing pipework 25 to 55 AZN per metre, Sanitary point 180 to 350 AZN per point, Cable tray 35 to 65 AZN per metre, LV cable 8 to 25 AZN per metre, Distribution board 800 to 3500 AZN each, Lighting fixture 45 to 120 AZN each, Emergency lighting 80 to 180 AZN each, Fire alarm 35 to 65 AZN per square metre, Sprinkler system 45 to 75 AZN per square metre, Access control 800 to 2500 AZN per door, CCTV 250 to 600 AZN per camera, Concrete paving 35 to 55 AZN per square metre, Natural stone paving 85 to 150 AZN per square metre, Soft landscape 25 to 55 AZN per square metre, Site fencing 45 to 120 AZN per metre, Passenger lift 45000 to 80000 AZN each, Freight lift 60000 to 120000 AZN each."""
@@ -120,6 +115,85 @@ def get_sheet(tab="Sheet1"):
         return None
 
 
+def get_file_memory_sheet():
+    """Get or create File Memory tab"""
+    try:
+        client      = get_gspread_client()
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+        try:
+            return spreadsheet.worksheet("File Memory")
+        except:
+            sheet = spreadsheet.add_worksheet(
+                title="File Memory", rows=1000, cols=4)
+            sheet.append_row(["Sender", "Filename", "Content", "Saved At"])
+            logger.info("Created File Memory tab")
+            return sheet
+    except Exception as e:
+        logger.error(f"File memory sheet error: {e}")
+        return None
+
+
+def save_files_to_memory(sender, attachments):
+    """Save attachment content to File Memory tab — replaces previous files from same sender"""
+    try:
+        sheet = get_file_memory_sheet()
+        if not sheet:
+            return
+
+        # Get all existing rows
+        all_values = sheet.get_all_values()
+
+        # Find and delete existing rows for this sender
+        rows_to_delete = []
+        for i, row in enumerate(all_values[1:], start=2):
+            if row and row[0].strip().lower() == sender.lower():
+                rows_to_delete.append(i)
+
+        # Delete in reverse order to maintain row numbers
+        for row_num in reversed(rows_to_delete):
+            sheet.delete_rows(row_num)
+
+        # Save new files
+        saved_at = datetime.now().strftime("%d.%m.%Y %H:%M")
+        for att in attachments:
+            sheet.append_row([
+                sender,
+                att["name"],
+                att["content"][:10000],
+                saved_at
+            ])
+            logger.info(f"Saved to file memory: {att['name']} from {sender}")
+
+    except Exception as e:
+        logger.error(f"Save file memory error: {e}")
+
+
+def load_files_from_memory(sender):
+    """Load previously saved files for this sender"""
+    try:
+        sheet = get_file_memory_sheet()
+        if not sheet:
+            return []
+
+        all_values = sheet.get_all_values()
+        files = []
+        for row in all_values[1:]:
+            if row and row[0].strip().lower() == sender.lower():
+                files.append({
+                    "name":    row[1] if len(row) > 1 else "file",
+                    "content": row[2] if len(row) > 2 else "",
+                    "saved_at": row[3] if len(row) > 3 else ""
+                })
+
+        if files:
+            logger.info(f"Loaded {len(files)} files from memory for {sender}")
+        return files
+
+    except Exception as e:
+        logger.error(f"Load file memory error: {e}")
+        return []
+
+
 def get_processed_sheet():
     try:
         client      = get_gspread_client()
@@ -137,7 +211,6 @@ def get_processed_sheet():
 
 
 def load_processed_ids():
-    """Load from sheet once on startup only"""
     global _processed_ids_cache, _cache_loaded
     if _cache_loaded:
         return _processed_ids_cache
@@ -156,16 +229,13 @@ def load_processed_ids():
 
 
 def mark_as_processed(msg_id):
-    """Add to in-memory cache immediately AND save to sheet"""
     global _processed_ids_cache
     if not msg_id:
         return
     msg_id = str(msg_id).strip()
     if msg_id in _processed_ids_cache:
         return
-    # Add to cache immediately — prevents duplicate processing in same run
     _processed_ids_cache.add(msg_id)
-    # Save to sheet for persistence across redeploys
     try:
         sheet = get_processed_sheet()
         if sheet:
@@ -354,14 +424,18 @@ def send_email(to_emails, subject, body, reply_to_msg_id=None, references=None):
         return False
 
 
-def analyse_email(sender, subject, body, attachments=None, is_cc=False):
+def analyse_email(sender, subject, body, attachments=None, memory_files=None, is_cc=False):
     try:
+        # Build context — current attachments take priority over memory files
+        all_files = attachments or memory_files or []
+        has_memory = not attachments and memory_files
+
         if is_cc:
             full_content = body
-            if attachments:
-                full_content += "\n\nATTACHMENTS:\n"
-                for att in attachments:
-                    full_content += f"\n{att['name']}:\n{att['content']}\n"
+            if all_files:
+                full_content += "\n\nFILES:\n"
+                for f in all_files:
+                    full_content += f"\n{f['name']}:\n{f['content']}\n"
             prompt = f"""CC'd email — internal analysis only. Do not reply to sender.
 
 From: {sender}
@@ -379,31 +453,37 @@ Full internal assessment:
 Plain professional prose. Numbered paragraphs. No symbols."""
 
         else:
-            if attachments:
-                att_content = chr(10).join([
-                    f"{a['name']}:\n{a['content']}" for a in attachments
+            if all_files:
+                memory_note = ""
+                if has_memory:
+                    saved_at = memory_files[0].get("saved_at", "previously") if memory_files else ""
+                    memory_note = f"Note: No new files attached. Using files previously received from this sender on {saved_at}.\n\n"
+
+                files_content = chr(10).join([
+                    f"{f['name']}:\n{f['content']}" for f in all_files
                 ])
-                prompt = f"""Email with attachments from SCOPE team member.
+                prompt = f"""Email from SCOPE team member.
 
 From: {sender}
 Subject: {subject}
 Email body: {body}
 
-FULL ATTACHMENT CONTENT:
-{att_content}
+{memory_note}FILE CONTENT — ALL SHEETS:
+{files_content}
 
 Analyse every sheet and every position immediately. Do not skip any discipline.
 For every position state: within market range, above market, or below market. Give market range.
 Flag missing items. Give total risk exposure at end.
 Write complete formal professional reply with full analysis now."""
             else:
-                prompt = f"""Email from SCOPE team member.
+                prompt = f"""Email from SCOPE team member. No files attached and no files previously received from this sender.
 
 From: {sender}
 Subject: {subject}
 Content: {body}
 
-Write complete formal professional reply in English unless email is entirely in Azerbaijani."""
+Write complete formal professional reply in English unless email is entirely in Azerbaijani.
+If the email asks about a document or file that has not been provided, politely request it and confirm you will analyse immediately upon receipt."""
 
         response = anthropic_client.messages.create(
             model=MODEL,
@@ -456,12 +536,10 @@ def process_emails():
                 msg_id_hdr = safe_decode(msg.get("Message-ID"), "").strip()
                 unique_id  = msg_id_hdr or eid_str
 
-                # Skip immediately if already processed — uses in-memory cache
                 if is_processed(unique_id):
                     continue
 
-                # Mark as processed IMMEDIATELY before any processing
-                # This prevents duplicate replies even if processing takes time
+                # Mark immediately — prevents any duplicate processing
                 mark_as_processed(unique_id)
 
                 sender       = extract_email_address(msg.get("From", ""))
@@ -486,15 +564,26 @@ def process_emails():
                 body        = get_email_body(msg)
                 attachments = extract_attachments(msg)
 
+                # If new files received — save to memory (replaces old files)
                 if attachments:
-                    logger.info(f"Attachments found: {[a['name'] for a in attachments]}")
+                    logger.info(f"New files received: {[a['name'] for a in attachments]}")
+                    save_files_to_memory(sender, attachments)
+                    memory_files = None
+                else:
+                    # No new files — load from memory
+                    memory_files = load_files_from_memory(sender)
+                    if memory_files:
+                        logger.info(f"Using {len(memory_files)} files from memory for {sender}")
 
                 logger.info(f"Processing: {sender} | {subject}")
 
                 if is_direct and is_internal:
                     analysis = analyse_email(
                         sender, subject, body,
-                        attachments=attachments, is_cc=False)
+                        attachments=attachments,
+                        memory_files=memory_files,
+                        is_cc=False
+                    )
                     if analysis:
                         reply_sub = f"Re: {subject}" if not subject.startswith("Re:") else subject
                         all_recipients = list(set(
@@ -520,7 +609,10 @@ def process_emails():
                 elif is_cc_email:
                     analysis = analyse_email(
                         sender, subject, body,
-                        attachments=attachments, is_cc=True)
+                        attachments=attachments,
+                        memory_files=memory_files,
+                        is_cc=True
+                    )
                     if analysis:
                         save_to_memory(
                             sender, subject,
@@ -595,14 +687,10 @@ def main():
     logger.info(f"Authorised team: {SCOPE_TEAM_EMAILS}")
     logger.info(f"Report recipients: {REPORT_RECIPIENTS}")
 
-    # Load all processed IDs into memory on startup
     load_processed_ids()
-    logger.info("Processed IDs loaded — duplicate protection active")
+    logger.info("Duplicate protection active")
 
-    # Check every 10 minutes
     schedule.every(10).minutes.do(process_emails)
-
-    # Morning report 9:00 AM Baku = 05:00 UTC
     schedule.every().day.at("05:00").do(send_morning_report)
 
     process_emails()
