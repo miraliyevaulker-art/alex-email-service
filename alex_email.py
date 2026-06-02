@@ -45,9 +45,7 @@ logger = logging.getLogger(__name__)
 anthropic_client     = Anthropic(api_key=ANTHROPIC_API_KEY)
 _processed_ids_cache = set()
 _cache_loaded        = False
-
-# In-memory file cache — sender email -> list of files
-_file_memory_cache = {}
+_file_memory_cache   = {}
 
 SYSTEM_PROMPT = """You are Alex Rivera, Construction Expert at SCOPE Consulting MMC.
 
@@ -77,11 +75,23 @@ Never ask for files that were already sent previously. If files were previously 
 Only request files if you have genuinely never received any from this sender.
 
 DOCUMENT ANALYSIS - CRITICAL:
-When any BOQ, Smeta, Excel, cost schedule, or pricing document is provided analyse every single sheet and every single position immediately.
-Do not skip any sheet. Do not skip mezzanine, fit-out, MEP, civil, structural, external works, or any discipline.
-For every position state whether the rate is within market range, above market, or below market and give the Baku market range.
-Flag all missing items and scope gaps across all sheets.
-Give total risk exposure at the end.
+When any BOQ, Smeta, Excel, cost schedule, or pricing document is provided you must analyse every single discipline, every single sheet, and every single line item with equal depth and rigour. No discipline is summarised. No discipline is skipped.
+
+Civil works: review every excavation, concrete, formwork, reinforcement, and masonry position individually. For each state the item description, quantity submitted, unit rate submitted, whether the rate is within Baku market range, above market or below market, the Baku market range, and any quantity concerns.
+
+Fit-out works: review every partition, ceiling, flooring, tiling, painting, joinery, and door position individually with the same depth.
+
+MEP works — IDENTICAL DEPTH TO CIVIL AND FIT-OUT — NEVER SUMMARISE AS A BLOCK:
+Mechanical: review every ductwork item, fan coil unit, chiller, AHU, VAV box, grille, diffuser, insulation run, pipework run, pump, valve, and control item individually.
+Electrical: review every cable run, cable tray, distribution board, lighting fixture, emergency light, socket, switch, earthing conductor, and containment item individually.
+Fire protection: review every sprinkler head, sprinkler pipe run, fire pump, alarm panel, smoke detector, heat detector, and suppression item individually.
+Low voltage and ICT: review every access control point, CCTV camera, structured cabling run, server rack, and equipment item individually.
+Plumbing: review every pipework run, fitting, sanitary fixture, tap, valve, and drainage item individually.
+
+For every single line item across all disciplines state: item description, quantity submitted, unit rate submitted, market assessment, Baku market range, and quantity concerns if any.
+
+Flag all missing scope items across all disciplines.
+Provide a discipline-by-discipline cost risk summary and a combined total risk exposure at the end.
 
 SIGNATURE — always end every email with exactly this:
 
@@ -91,7 +101,7 @@ SCOPE Consulting MMC
 internal@scope-iq.io
 
 BAKU MARKET RATES:
-Mechanical excavation 8 to 15 AZN per cubic metre, Manual excavation 60 to 90 AZN per cubic metre, Concrete C25/30 190 to 240 AZN per cubic metre, Reinforcement 1200 to 1500 AZN per tonne, Formwork 18 to 28 AZN per square metre, External brickwork 25 to 40 AZN per square metre, Internal brickwork 20 to 32 AZN per square metre, Plastering 16 to 24 AZN per square metre, Paint 12 to 18 AZN per square metre, Ceramic tiles 25 to 40 AZN per square metre, Premium tiles 45 to 80 AZN per square metre, Gypsum partition 32 to 48 AZN per square metre, Armstrong ceiling 28 to 42 AZN per square metre, Raised access floor 55 to 85 AZN per square metre, Epoxy floor 35 to 55 AZN per square metre, Carpet tiles 40 to 70 AZN per square metre, Aluminium glazing 180 to 280 AZN per square metre, Timber door 350 to 550 AZN each, Fire door 600 to 1200 AZN each, Metal door 4500 to 6500 AZN each, Aluminium door 700 to 900 AZN each, HVAC ductwork 45 to 75 AZN per square metre, Fan coil unit 350 to 600 AZN each, Chiller 120 to 200 AZN per kW, Plumbing pipework 25 to 55 AZN per metre, Sanitary point 180 to 350 AZN per point, Cable tray 35 to 65 AZN per metre, LV cable 8 to 25 AZN per metre, Distribution board 800 to 3500 AZN each, Lighting fixture 45 to 120 AZN each, Emergency lighting 80 to 180 AZN each, Fire alarm 35 to 65 AZN per square metre, Sprinkler system 45 to 75 AZN per square metre, Access control 800 to 2500 AZN per door, CCTV 250 to 600 AZN per camera, Concrete paving 35 to 55 AZN per square metre, Natural stone paving 85 to 150 AZN per square metre, Soft landscape 25 to 55 AZN per square metre, Site fencing 45 to 120 AZN per metre, Passenger lift 45000 to 80000 AZN each, Freight lift 60000 to 120000 AZN each."""
+Mechanical excavation 8 to 15 AZN per cubic metre, Manual excavation 60 to 90 AZN per cubic metre, Concrete C25/30 190 to 240 AZN per cubic metre, Reinforcement 1200 to 1500 AZN per tonne, Formwork 18 to 28 AZN per square metre, External brickwork 25 to 40 AZN per square metre, Internal brickwork 20 to 32 AZN per square metre, Plastering 16 to 24 AZN per square metre, Paint 12 to 18 AZN per square metre, Ceramic tiles 25 to 40 AZN per square metre, Premium tiles 45 to 80 AZN per square metre, Gypsum partition 32 to 48 AZN per square metre, Armstrong ceiling 28 to 42 AZN per square metre, Raised access floor 55 to 85 AZN per square metre, Epoxy floor 35 to 55 AZN per square metre, Carpet tiles 40 to 70 AZN per square metre, Aluminium glazing 180 to 280 AZN per square metre, Timber door 350 to 550 AZN each, Fire door 600 to 1200 AZN each, Metal door 4500 to 6500 AZN each, Aluminium door 700 to 900 AZN each, HVAC ductwork 45 to 75 AZN per square metre, Fan coil unit 350 to 600 AZN each, Chiller 120 to 200 AZN per kW, AHU 800 to 2500 AZN each, VAV box 250 to 600 AZN each, Grille and diffuser 35 to 85 AZN each, Duct insulation 15 to 28 AZN per square metre, Plumbing pipework 25 to 55 AZN per metre, Sanitary fixture 180 to 450 AZN each, Pump 800 to 3500 AZN each, Cable tray 35 to 65 AZN per metre, LV cable 8 to 25 AZN per metre, Distribution board 800 to 3500 AZN each, Lighting fixture 45 to 120 AZN each, Emergency lighting 80 to 180 AZN each, Socket and switch 25 to 65 AZN each, Fire alarm panel 1500 to 8000 AZN each, Smoke detector 45 to 120 AZN each, Sprinkler head 25 to 55 AZN each, Sprinkler pipework 18 to 45 AZN per metre, Fire pump 3500 to 12000 AZN each, Access control 800 to 2500 AZN per door, CCTV camera 250 to 600 AZN each, Structured cabling point 85 to 180 AZN each, Concrete paving 35 to 55 AZN per square metre, Natural stone paving 85 to 150 AZN per square metre, Soft landscape 25 to 55 AZN per square metre, Site fencing 45 to 120 AZN per metre, Passenger lift 45000 to 80000 AZN each, Freight lift 60000 to 120000 AZN each."""
 
 
 def get_gspread_client():
@@ -119,7 +129,6 @@ def get_sheet(tab="Sheet1"):
 
 
 def get_or_create_sheet(title, rows=1000, cols=4):
-    """Get existing sheet tab or create it"""
     try:
         client      = get_gspread_client()
         spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
@@ -135,14 +144,8 @@ def get_or_create_sheet(title, rows=1000, cols=4):
 
 
 def save_files_to_memory(sender, attachments):
-    """
-    Save attachment content to Google Sheet AND in-memory cache.
-    Replaces all previous files from same sender.
-    """
     global _file_memory_cache
     sender = sender.strip().lower()
-
-    # Save to in-memory cache immediately
     _file_memory_cache[sender] = [
         {
             "name":     att["name"],
@@ -151,65 +154,42 @@ def save_files_to_memory(sender, attachments):
         }
         for att in attachments
     ]
-    logger.info(f"Saved {len(attachments)} files to in-memory cache for {sender}")
-
-    # Also persist to Google Sheet
+    logger.info(f"Saved {len(attachments)} files to memory for {sender}")
     try:
         sheet = get_or_create_sheet("File Memory", rows=2000, cols=4)
         if not sheet:
             return
-
-        # Initialize header if empty
         all_values = sheet.get_all_values()
         if not all_values:
             sheet.append_row(["Sender", "Filename", "Content", "Saved At"])
             all_values = [["Sender", "Filename", "Content", "Saved At"]]
-
-        # Delete existing rows for this sender
         rows_to_delete = []
         for i, row in enumerate(all_values):
             if i == 0:
                 continue
             if row and len(row) > 0 and row[0].strip().lower() == sender:
                 rows_to_delete.append(i + 1)
-
         for row_num in reversed(rows_to_delete):
             sheet.delete_rows(row_num)
-
-        # Append new files
         saved_at = datetime.now().strftime("%d.%m.%Y %H:%M")
         for att in attachments:
-            sheet.append_row([
-                sender,
-                att["name"],
-                att["content"][:10000],
-                saved_at
-            ])
-        logger.info(f"Saved {len(attachments)} files to sheet for {sender}")
-
+            sheet.append_row([sender, att["name"], att["content"][:10000], saved_at])
+        logger.info(f"Persisted {len(attachments)} files to sheet for {sender}")
     except Exception as e:
         logger.error(f"Save files to sheet error: {e}")
 
 
 def load_files_from_memory(sender):
-    """
-    Load files for sender — check in-memory cache first, then Google Sheet.
-    """
     global _file_memory_cache
     sender = sender.strip().lower()
-
-    # Check in-memory cache first (fastest)
     if sender in _file_memory_cache and _file_memory_cache[sender]:
         files = _file_memory_cache[sender]
-        logger.info(f"Loaded {len(files)} files from in-memory cache for {sender}")
+        logger.info(f"Loaded {len(files)} files from cache for {sender}")
         return files
-
-    # Fall back to Google Sheet
     try:
         sheet = get_or_create_sheet("File Memory", rows=2000, cols=4)
         if not sheet:
             return []
-
         all_values = sheet.get_all_values()
         files = []
         for row in all_values[1:]:
@@ -219,18 +199,12 @@ def load_files_from_memory(sender):
                     "content":  row[2] if len(row) > 2 else "",
                     "saved_at": row[3] if len(row) > 3 else ""
                 })
-
         if files:
-            # Populate in-memory cache from sheet
             _file_memory_cache[sender] = files
             logger.info(f"Loaded {len(files)} files from sheet for {sender}")
-        else:
-            logger.info(f"No files in memory for {sender}")
-
         return files
-
     except Exception as e:
-        logger.error(f"Load files from sheet error: {e}")
+        logger.error(f"Load files error: {e}")
         return []
 
 
@@ -245,7 +219,6 @@ def load_processed_ids():
     try:
         sheet = get_processed_sheet()
         if sheet:
-            # Add header if empty
             all_values = sheet.get_all_values()
             if not all_values:
                 sheet.append_row(["Message ID", "Processed At"])
@@ -458,9 +431,8 @@ def send_email(to_emails, subject, body, reply_to_msg_id=None, references=None):
 
 def analyse_email(sender, subject, body, attachments=None, memory_files=None, is_cc=False):
     try:
-        # Use current attachments if available, otherwise use memory files
-        active_files  = attachments if attachments else memory_files
-        using_memory  = not attachments and bool(memory_files)
+        active_files = attachments if attachments else memory_files
+        using_memory = not attachments and bool(memory_files)
 
         if is_cc:
             full_content = body
@@ -488,13 +460,14 @@ Plain professional prose. Numbered paragraphs. No symbols."""
             if active_files:
                 memory_note = ""
                 if using_memory:
-                    saved_at = active_files[0].get("saved_at", "previously") if active_files else ""
+                    saved_at   = active_files[0].get("saved_at", "previously") if active_files else ""
                     file_names = ", ".join([f["name"] for f in active_files])
                     memory_note = f"Note: No new files in this email. Using files previously received from this sender ({file_names}, saved {saved_at}).\n\n"
 
                 files_content = chr(10).join([
                     f"{f['name']}:\n{f['content']}" for f in active_files
                 ])
+
                 prompt = f"""Email from SCOPE team member.
 
 From: {sender}
@@ -504,10 +477,11 @@ Email body: {body}
 {memory_note}FILE CONTENT — ALL SHEETS:
 {files_content}
 
-Answer the question using the file content above.
-If this is a BOQ review, analyse every sheet and every position immediately.
-For every position state: within market range, above market, or below market with market range.
-Flag missing items. Give total risk exposure at end.
+Analyse every discipline, every sheet, and every single line item with equal depth.
+Civil, fit-out, and all MEP disciplines — each line item reviewed individually. Never summarise any discipline as a block.
+For each line item: description, quantity, unit rate, market assessment, Baku market range, quantity concerns.
+MEP receives identical line-by-line depth as civil and fit-out. Every ductwork item, cable run, fixture, pipe, sprinkler head — individually assessed.
+Flag all missing scope. Discipline-by-discipline risk summary. Combined total risk exposure at end.
 Write complete formal professional reply with full analysis now."""
 
             else:
@@ -518,11 +492,11 @@ Subject: {subject}
 Content: {body}
 
 Write complete formal professional reply.
-If the question requires document analysis and no files have ever been provided, politely request them and confirm you will reply within minutes of receipt."""
+If document analysis is required and no files have ever been provided, politely request them and confirm reply within minutes of receipt."""
 
         response = anthropic_client.messages.create(
             model=MODEL,
-            max_tokens=3000,
+            max_tokens=4000,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -574,7 +548,6 @@ def process_emails():
                 if is_processed(unique_id):
                     continue
 
-                # Mark as processed IMMEDIATELY — prevents any duplicate
                 mark_as_processed(unique_id)
 
                 sender       = extract_email_address(msg.get("From", ""))
@@ -600,21 +573,34 @@ def process_emails():
                 attachments = extract_attachments(msg)
 
                 if attachments:
-                    # New files received — save to memory, replacing old ones
                     logger.info(f"New files from {sender}: {[a['name'] for a in attachments]}")
                     save_files_to_memory(sender, attachments)
                     memory_files = None
                 else:
-                    # No new files — load from memory
                     memory_files = load_files_from_memory(sender)
                     if memory_files:
-                        logger.info(f"Using {len(memory_files)} files from memory for {sender}: {[f['name'] for f in memory_files]}")
-                    else:
-                        logger.info(f"No files in memory for {sender}")
+                        logger.info(f"Using {len(memory_files)} memory files for {sender}")
 
                 logger.info(f"Processing: {sender} | {subject}")
 
-                if is_direct and is_internal:
+                # CC'd email — silent analysis only, NEVER reply
+                if is_cc_email:
+                    logger.info(f"CC'd email — silent log only, no reply: {sender}")
+                    analysis = analyse_email(
+                        sender, subject, body,
+                        attachments=attachments,
+                        memory_files=memory_files,
+                        is_cc=True
+                    )
+                    if analysis:
+                        save_to_memory(
+                            sender, subject,
+                            analysis[:400], analysis[:500],
+                            "Monitoring"
+                        )
+
+                # Direct email from internal team — reply
+                elif is_direct and is_internal:
                     analysis = analyse_email(
                         sender, subject, body,
                         attachments=attachments,
@@ -640,22 +626,9 @@ def process_emails():
                             "Closed" if sent else "Open"
                         )
 
+                # Direct email from external — ignore completely
                 elif is_direct and not is_internal:
-                    logger.info(f"Ignoring external: {sender}")
-
-                elif is_cc_email:
-                    analysis = analyse_email(
-                        sender, subject, body,
-                        attachments=attachments,
-                        memory_files=memory_files,
-                        is_cc=True
-                    )
-                    if analysis:
-                        save_to_memory(
-                            sender, subject,
-                            analysis[:400], analysis[:500],
-                            "Monitoring"
-                        )
+                    logger.info(f"Ignoring external direct: {sender}")
 
             except Exception as e:
                 logger.error(f"Email error: {e}")
