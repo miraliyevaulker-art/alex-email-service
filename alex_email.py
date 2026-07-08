@@ -21,16 +21,13 @@ GOOGLE_SHEET_ID   = os.environ.get("GOOGLE_SHEET_ID", "1_4L63VqFN6etwLRWW2zT0WyJ
 GOOGLE_CREDS_FILE = "primordial-mile-495807-k9-0217981265dd.json"
 MODEL             = "claude-haiku-4-5-20251001"
 
-IMAP_HOST     = "imappro.zoho.com"
-IMAP_PORT     = 993
-
-# Chase protocol thresholds (days)
+IMAP_HOST        = "imappro.zoho.com"
+IMAP_PORT        = 993
 REMINDER_1_DAYS  = 3
 REMINDER_2_DAYS  = 7
 REMINDER_3_DAYS  = 14
 AUTO_CLOSE_DAYS  = 21
-
-ALWAYS_CC = "alishir.aliyev@scopeconsulting.az"
+ALWAYS_CC        = "alishir.aliyev@scopeconsulting.az"
 
 SCOPE_TEAM_EMAILS = [
     e.strip().lower() for e in
@@ -169,7 +166,6 @@ def save_files_to_memory(sender, attachments):
         saved_at = datetime.now().strftime("%d.%m.%Y %H:%M")
         for att in attachments:
             sheet.append_row([sender, att["name"], att["content"][:10000], saved_at])
-        logger.info(f"Files saved for {sender}")
     except Exception as e:
         logger.error(f"Save files error: {e}")
 
@@ -244,14 +240,10 @@ def is_processed(msg_id):
 
 
 def save_to_monitoring(sender, subject, summary, action, thread_id, status="Monitoring"):
-    """
-    Columns: Date | Sender | Subject | Summary | Action | Status | Thread-ID | Last Reminded | Reminder Count
-    """
     try:
         sheet = get_sheet("Sheet1")
         if sheet:
             headers = sheet.row_values(1)
-            # Ensure all columns exist
             for col, name in [(7, "Thread-ID"), (8, "Last Reminded"), (9, "Reminder Count")]:
                 if len(headers) < col:
                     sheet.update_cell(1, col, name)
@@ -260,7 +252,6 @@ def save_to_monitoring(sender, subject, summary, action, thread_id, status="Moni
                 sender, subject, summary, action, status,
                 thread_id, "", "0"
             ])
-            logger.info(f"Saved monitoring: {subject}")
     except Exception as e:
         logger.error(f"Save monitoring error: {e}")
 
@@ -273,7 +264,6 @@ def save_to_memory(sender, subject, summary, action, status="Open"):
                 datetime.now().strftime("%d.%m.%Y %H:%M"),
                 sender, subject, summary, action, status, "", "", "0"
             ])
-            logger.info(f"Saved: {subject}")
     except Exception as e:
         logger.error(f"Save error: {e}")
 
@@ -315,6 +305,151 @@ def get_first_name(email_address):
         return "Colleague"
 
 
+def build_report_html(pending, closed, today, day_name, time_now):
+    n_open    = len([r for r in pending if r.get("Status") == "Open"])
+    n_monitor = len([r for r in pending if r.get("Status") == "Monitoring"])
+    n_closed  = len(closed)
+    n_total   = len(pending) + n_closed
+
+    items_html = ""
+    if pending:
+        for i, r in enumerate(pending[-15:], 1):
+            subj    = r.get("Subject") or "No subject"
+            sender  = r.get("Sender")  or "Unknown"
+            date    = r.get("Date")    or "Not recorded"
+            status  = r.get("Status")  or "Open"
+            summary = r.get("Summary") or "No summary available"
+            action  = r.get("Action")  or "Review and action required"
+
+            status_color = "#f0a030" if status == "Open" else "#3CB496"
+            status_bg    = "#fff8ee" if status == "Open" else "#e1f5ee"
+            status_text  = "#9a6000" if status == "Open" else "#0f6e56"
+
+            items_html += f"""
+            <div style="border:1px solid #e8e8e8;border-radius:8px;margin-bottom:16px;overflow:hidden;font-family:Arial,sans-serif;">
+                <div style="background:#f8f9fa;padding:12px 16px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #e8e8e8;">
+                    <span style="font-size:12px;color:#888;font-weight:500;">ITEM {i} OF {len(pending)}</span>
+                    <span style="background:{status_bg};color:{status_text};font-size:11px;padding:3px 10px;border-radius:20px;font-weight:500;">{status}</span>
+                </div>
+                <div style="padding:16px;">
+                    <table style="width:100%;font-size:13px;border-collapse:collapse;">
+                        <tr><td style="color:#888;padding:4px 0;width:120px;">Subject</td><td style="color:#1a2942;font-weight:600;padding:4px 0;">{subj}</td></tr>
+                        <tr><td style="color:#888;padding:4px 0;">From</td><td style="color:#333;padding:4px 0;">{sender}</td></tr>
+                        <tr><td style="color:#888;padding:4px 0;">Date received</td><td style="color:#333;padding:4px 0;">{date}</td></tr>
+                    </table>
+                    <div style="border-top:1px solid #f0f0f0;margin:12px 0;"></div>
+                    <div style="margin-bottom:10px;">
+                        <div style="font-size:11px;color:#888;font-weight:500;letter-spacing:0.5px;text-transform:uppercase;margin-bottom:4px;">Content summary</div>
+                        <div style="font-size:13px;color:#444;line-height:1.6;">{summary}</div>
+                    </div>
+                    <div style="background:#fff8ee;border:1px solid #f0c060;border-radius:6px;padding:10px 12px;">
+                        <div style="font-size:10px;font-weight:600;color:#9a6000;letter-spacing:0.5px;text-transform:uppercase;margin-bottom:4px;">Action required</div>
+                        <div style="font-size:13px;color:#5a3a00;line-height:1.5;">{action}</div>
+                    </div>
+                </div>
+            </div>"""
+
+    no_items_html = ""
+    if not pending:
+        no_items_html = """
+        <div style="text-align:center;padding:32px;font-family:Arial,sans-serif;">
+            <div style="width:48px;height:48px;border-radius:50%;background:#e1f5ee;display:flex;align-items:center;justify-content:center;margin:0 auto 12px;font-size:24px;">✓</div>
+            <div style="font-size:15px;color:#333;font-weight:500;margin-bottom:6px;">All clear</div>
+            <div style="font-size:13px;color:#888;">No outstanding emails or open action items as of today.</div>
+        </div>"""
+
+    greeting = ""
+    if pending:
+        greeting = f"Good morning. Please find below the daily email monitoring report for <strong>{today}</strong>. The following <strong>{len(pending)} item(s)</strong> require your attention."
+    else:
+        greeting = f"Good morning. This is your daily email monitoring report for <strong>{today}</strong>. All monitored threads are closed or have received responses."
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif;">
+<div style="max-width:620px;margin:0 auto;padding:20px 0;">
+
+  <!-- Header -->
+  <div style="background:#1a2942;border-radius:12px 12px 0 0;padding:24px 28px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <div style="color:#fff;font-size:22px;font-weight:600;letter-spacing:1px;">SCOPE <span style="color:#3CB496;">IQ</span></div>
+      <div style="background:#3CB496;color:#fff;font-size:11px;padding:4px 12px;border-radius:20px;font-weight:500;">Daily Report</div>
+    </div>
+    <table style="width:100%;font-size:12px;border-collapse:collapse;">
+      <tr>
+        <td style="color:#8facc8;padding:2px 0;width:50%;">Date &nbsp;<strong style="color:#c8ddf0;">{day_name}, {today}</strong></td>
+        <td style="color:#8facc8;padding:2px 0;">Time &nbsp;<strong style="color:#c8ddf0;">{time_now} Baku</strong></td>
+      </tr>
+      <tr>
+        <td style="color:#8facc8;padding:2px 0;">Prepared by &nbsp;<strong style="color:#c8ddf0;">Alex Rivera</strong></td>
+        <td style="color:#8facc8;padding:2px 0;">Status &nbsp;<strong style="color:#c8ddf0;">{"All clear" if not pending else f"{len(pending)} item(s) open"}</strong></td>
+      </tr>
+    </table>
+  </div>
+
+  <!-- Stats bar -->
+  <div style="background:#243550;padding:12px 28px;display:flex;gap:0;">
+    <div style="flex:1;text-align:center;border-right:1px solid #1a2942;">
+      <div style="font-size:22px;font-weight:600;color:#f0a030;">{n_open}</div>
+      <div style="font-size:11px;color:#8facc8;margin-top:2px;">Open</div>
+    </div>
+    <div style="flex:1;text-align:center;border-right:1px solid #1a2942;">
+      <div style="font-size:22px;font-weight:600;color:#3CB496;">{n_monitor}</div>
+      <div style="font-size:11px;color:#8facc8;margin-top:2px;">Monitoring</div>
+    </div>
+    <div style="flex:1;text-align:center;border-right:1px solid #1a2942;">
+      <div style="font-size:22px;font-weight:600;color:#6ab87a;">{n_closed}</div>
+      <div style="font-size:11px;color:#8facc8;margin-top:2px;">Closed</div>
+    </div>
+    <div style="flex:1;text-align:center;">
+      <div style="font-size:22px;font-weight:600;color:#8facc8;">{n_total}</div>
+      <div style="font-size:11px;color:#8facc8;margin-top:2px;">Total</div>
+    </div>
+  </div>
+
+  <!-- Body -->
+  <div style="background:#fff;border:1px solid #e8e8e8;border-top:none;border-radius:0 0 12px 12px;padding:24px 28px;">
+
+    <p style="font-size:14px;color:#444;line-height:1.7;margin:0 0 20px;">{greeting}</p>
+
+    {"<div style='font-size:11px;font-weight:600;color:#888;letter-spacing:1px;text-transform:uppercase;margin-bottom:12px;'>Outstanding items</div>" if pending else ""}
+
+    {items_html}
+    {no_items_html}
+
+    <!-- Footer -->
+    <div style="border-top:1px solid #f0f0f0;margin-top:24px;padding-top:20px;display:flex;justify-content:space-between;align-items:flex-end;">
+      <div style="font-size:12px;color:#666;line-height:1.8;">
+        <strong style="color:#1a2942;font-size:13px;">Alex Rivera</strong><br>
+        Construction Expert<br>
+        SCOPE Consulting MMC<br>
+        <a href="mailto:internal@scope-iq.io" style="color:#3CB496;text-decoration:none;">internal@scope-iq.io</a>
+      </div>
+      <div style="font-size:11px;color:#aaa;text-align:right;line-height:1.7;">
+        Generated automatically<br>
+        SCOPE IQ Email Monitoring<br>
+        09:00 Baku daily
+      </div>
+    </div>
+
+    <!-- Chase protocol note -->
+    <div style="background:#f8f9fa;border-radius:6px;padding:10px 14px;margin-top:16px;">
+      <div style="font-size:11px;color:#888;line-height:1.6;">
+        <strong style="color:#555;">Chase protocol:</strong>
+        Reminder at day 3 &nbsp;·&nbsp; Second reminder at day 7 &nbsp;·&nbsp;
+        Escalation at day 14 &nbsp;·&nbsp; Auto-close at day 21
+      </div>
+    </div>
+
+  </div>
+</div>
+</body>
+</html>"""
+
+    return html
+
+
 def check_thread_replies(thread_ids):
     replied_threads = set()
     if not thread_ids:
@@ -350,13 +485,6 @@ def check_thread_replies(thread_ids):
 
 
 def check_followup_reminders():
-    """
-    Chase protocol:
-    Day 3  — Reminder 1: polite follow-up to sender, CC Alishir
-    Day 7  — Reminder 2: firmer tone to sender, CC Alishir
-    Day 14 — Reminder 3: escalation to sender, CC all 3 recipients
-    Day 21 — Auto-close: marked Closed — No Response, reported in morning report
-    """
     logger.info("Checking follow-up reminders...")
     try:
         sheet = get_sheet("Sheet1")
@@ -369,7 +497,6 @@ def check_followup_reminders():
 
         today = datetime.now()
 
-        # First — check which monitoring threads have been replied to
         monitoring_threads = {}
         for i, row in enumerate(all_values[1:], start=2):
             if len(row) >= 6 and row[5].strip() == "Monitoring":
@@ -383,7 +510,6 @@ def check_followup_reminders():
                 update_row(row_num, status="Closed")
                 logger.info(f"Thread replied — closed row {row_num}")
 
-        # Reload after updates
         all_values = sheet.get_all_values()
 
         for i, row in enumerate(all_values[1:], start=2):
@@ -402,10 +528,8 @@ def check_followup_reminders():
 
                 if status not in ["Open", "Monitoring"]:
                     continue
-
                 if not sender or "@" not in sender:
                     continue
-
                 if not any(t in sender for t in SCOPE_TEAM_EMAILS):
                     continue
 
@@ -416,27 +540,17 @@ def check_followup_reminders():
 
                 days_open = (today - logged_date).days
 
-                # Auto-close after 21 days
                 if days_open >= AUTO_CLOSE_DAYS:
                     update_row(i, status="Closed — No Response")
-                    logger.info(f"Auto-closed after {days_open} days: {subject}")
-
-                    # Notify all recipients of auto-close
-                    notice  = f"Dear Team,\n\n"
-                    notice += f"This is to inform you that the following email thread has been automatically closed after {AUTO_CLOSE_DAYS} days with no response from the recipient.\n\n"
-                    notice += f"Subject        : {subject}\n"
-                    notice += f"From           : {sender}\n"
-                    notice += f"Date raised    : {date_str}\n"
-                    notice += f"Days open      : {days_open}\n"
-                    notice += f"Final status   : Closed — No Response\n\n"
+                    notice  = f"Dear Team,\n\nThe following email thread has been automatically closed after {AUTO_CLOSE_DAYS} days with no response.\n\n"
+                    notice += f"Subject: {subject}\nFrom: {sender}\nDate raised: {date_str}\nDays open: {days_open}\n\n"
                     notice += f"Summary:\n{summary}\n\n"
-                    notice += f"No further reminders will be sent for this item. If action is still required please reopen this matter directly.\n\n"
+                    notice += f"No further reminders will be sent. Please reopen directly if still required.\n\n"
                     notice += f"Kind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
-
-                    send_email(REPORT_RECIPIENTS, f"Auto-Closed — No Response — {subject}", notice)
+                    send_email(REPORT_RECIPIENTS,
+                               f"Auto-Closed — No Response — {subject}", notice)
                     continue
 
-                # Determine which reminder is due based on days open
                 reminder_due = None
                 if days_open >= REMINDER_3_DAYS and reminder_count < 3:
                     reminder_due = 3
@@ -448,7 +562,6 @@ def check_followup_reminders():
                 if not reminder_due:
                     continue
 
-                # Check last reminder was not sent too recently
                 if last_reminded:
                     try:
                         last_date = datetime.strptime(last_reminded, "%d.%m.%Y %H:%M")
@@ -458,53 +571,41 @@ def check_followup_reminders():
                         pass
 
                 first_name = get_first_name(sender)
-                today_str  = today.strftime("%d %B %Y")
 
                 if reminder_due == 1:
-                    # Day 3 — polite reminder
                     subject_line = f"Follow-up — {subject}"
                     body  = f"Dear {first_name},\n\n"
                     body += f"I am writing to follow up on the email referenced below, which was sent {days_open} days ago and appears to be awaiting a response.\n\n"
-                    body += f"Subject     : {subject}\n"
-                    body += f"Date raised : {date_str}\n\n"
-                    body += f"Summary:\n{summary}\n\n"
-                    body += f"Action required:\n{action}\n\n"
+                    body += f"Subject     : {subject}\nDate raised : {date_str}\n\n"
+                    body += f"Summary:\n{summary}\n\nAction required:\n{action}\n\n"
                     body += f"I would be grateful if you could review this matter and respond at your earliest convenience.\n\n"
                     body += f"Kind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
                     cc = [ALWAYS_CC] if sender.lower() != ALWAYS_CC.lower() else []
 
                 elif reminder_due == 2:
-                    # Day 7 — firmer reminder
                     subject_line = f"Second Follow-up — {subject}"
                     body  = f"Dear {first_name},\n\n"
                     body += f"This is a second follow-up regarding the matter below, which has now been open for {days_open} days without a response.\n\n"
-                    body += f"Subject     : {subject}\n"
-                    body += f"Date raised : {date_str}\n\n"
-                    body += f"Summary:\n{summary}\n\n"
-                    body += f"Action required:\n{action}\n\n"
-                    body += f"This matter requires your urgent attention. Please respond or confirm the current status of this item as soon as possible. If this has already been resolved through other channels please let us know so we can update our records accordingly.\n\n"
+                    body += f"Subject     : {subject}\nDate raised : {date_str}\n\n"
+                    body += f"Summary:\n{summary}\n\nAction required:\n{action}\n\n"
+                    body += f"This matter requires your urgent attention. Please respond or confirm the current status as soon as possible.\n\n"
                     body += f"Kind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
                     cc = [ALWAYS_CC] if sender.lower() != ALWAYS_CC.lower() else []
 
                 elif reminder_due == 3:
-                    # Day 14 — escalation, CC all recipients
                     subject_line = f"Escalation Notice — {subject}"
                     body  = f"Dear {first_name},\n\n"
-                    body += f"This is a formal escalation notice. The email thread referenced below has been open for {days_open} days and has not received a response despite two previous reminders sent on days 3 and 7.\n\n"
-                    body += f"Subject     : {subject}\n"
-                    body += f"Date raised : {date_str}\n\n"
-                    body += f"Summary:\n{summary}\n\n"
-                    body += f"Action required:\n{action}\n\n"
-                    body += f"Please be advised that if no response is received within 7 days this matter will be automatically closed and recorded as unresolved. We request an immediate response or confirmation of status.\n\n"
+                    body += f"This is a formal escalation notice. The email thread referenced below has been open for {days_open} days and has not received a response despite two previous reminders.\n\n"
+                    body += f"Subject     : {subject}\nDate raised : {date_str}\n\n"
+                    body += f"Summary:\n{summary}\n\nAction required:\n{action}\n\n"
+                    body += f"Please be advised that if no response is received within 7 days this matter will be automatically closed and recorded as unresolved.\n\n"
                     body += f"This notice has been copied to SCOPE Consulting management for awareness.\n\n"
                     body += f"Kind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
-                    # Escalate to all 3 recipients
                     cc = [r for r in REPORT_RECIPIENTS if r.lower() != sender.lower()]
 
                 sent = send_email([sender], subject_line, body, cc_emails=cc)
                 if sent:
-                    update_row(i,
-                               last_reminded=today.strftime("%d.%m.%Y %H:%M"),
+                    update_row(i, last_reminded=today.strftime("%d.%m.%Y %H:%M"),
                                reminder_count=reminder_due)
                     logger.info(f"Reminder {reminder_due} sent to {sender}: {subject}")
 
@@ -630,7 +731,8 @@ def get_email_body(msg):
     return body[:2000]
 
 
-def send_email(to_emails, subject, body, reply_to_msg_id=None, references=None, cc_emails=None):
+def send_email(to_emails, subject, body, reply_to_msg_id=None,
+               references=None, cc_emails=None, html_body=None):
     try:
         resend.api_key = RESEND_API_KEY
         if isinstance(to_emails, str):
@@ -645,6 +747,8 @@ def send_email(to_emails, subject, body, reply_to_msg_id=None, references=None, 
             "text":    body,
             "headers": {}
         }
+        if html_body:
+            params["html"] = html_body
         if cc_emails:
             cc_emails = [e for e in cc_emails if e.lower() != ZOHO_EMAIL.lower()]
             if cc_emails:
@@ -653,7 +757,7 @@ def send_email(to_emails, subject, body, reply_to_msg_id=None, references=None, 
             params["headers"]["In-Reply-To"] = reply_to_msg_id
             params["headers"]["References"]  = references or reply_to_msg_id
         resend.Emails.send(params)
-        logger.info(f"Sent to {to_emails} cc {cc_emails}")
+        logger.info(f"Sent to {to_emails}")
         return True
     except Exception as e:
         logger.error(f"Resend error: {e}")
@@ -843,84 +947,37 @@ def send_morning_report():
     logger.info("Sending morning report...")
     try:
         pending, closed = read_memory_for_report()
-        today     = datetime.now().strftime("%d %B %Y")
-        day_name  = datetime.now().strftime("%A")
-        time_now  = datetime.now().strftime("%H:%M")
-        n_open    = len([r for r in pending if r.get("Status") == "Open"])
-        n_monitor = len([r for r in pending if r.get("Status") == "Monitoring"])
-        n_closed  = len(closed)
-        n_total   = len(pending) + n_closed
+        today    = datetime.now().strftime("%d %B %Y")
+        day_name = datetime.now().strftime("%A")
+        time_now = datetime.now().strftime("%H:%M")
+        n_open   = len([r for r in pending if r.get("Status") == "Open"])
 
-        report  = "SCOPE IQ — EMAIL MONITORING REPORT\n"
-        report += "=" * 60 + "\n"
-        report += f"Date          : {day_name}, {today}\n"
-        report += f"Report time   : {time_now} Baku\n"
-        report += f"Prepared by   : Alex Rivera, Construction Expert\n"
-        report += f"Total tracked : {n_total} | Open: {n_open} | Monitoring: {n_monitor} | Closed: {n_closed}\n"
-        report += "=" * 60 + "\n\n"
+        # Build HTML report
+        html_body = build_report_html(pending, closed, today, day_name, time_now)
 
+        # Plain text fallback
+        plain = f"SCOPE IQ Daily Report — {today}\n\n"
         if pending:
-            report += "Dear Team,\n\n"
-            report += f"Good morning. Please find below the daily email monitoring report for {today}. "
-            report += f"The following {len(pending)} item(s) require your attention.\n\n"
-            report += "=" * 60 + "\n"
-            report += "OUTSTANDING ITEMS\n"
-            report += "=" * 60 + "\n\n"
-
+            plain += f"{len(pending)} item(s) require attention.\n\n"
             for i, r in enumerate(pending[-15:], 1):
-                subj    = r.get("Subject") or "No subject"
-                sender  = r.get("Sender")  or "Unknown"
-                date    = r.get("Date")    or "Not recorded"
-                status  = r.get("Status")  or "Open"
-                summary = r.get("Summary") or "No summary available"
-                action  = r.get("Action")  or "Review and action required"
-
-                report += f"ITEM {i} OF {len(pending)}\n"
-                report += "-" * 60 + "\n"
-                report += f"Subject        : {subj}\n"
-                report += f"From           : {sender}\n"
-                report += f"Date received  : {date}\n"
-                report += f"Current status : {status}\n"
-                report += "-" * 60 + "\n\n"
-                report += f"Content summary:\n{summary}\n\n"
-                report += f"Action required:\n{action}\n\n"
-                report += "=" * 60 + "\n\n"
-
-            report += "SUMMARY\n"
-            report += "-" * 60 + "\n"
-            report += f"Total items monitored   : {n_total}\n"
-            report += f"Items requiring action  : {n_open}\n"
-            report += f"Items under monitoring  : {n_monitor}\n"
-            report += f"Items closed            : {n_closed}\n"
-            report += "-" * 60 + "\n\n"
-            report += "Please ensure all outstanding items are addressed at your earliest convenience.\n\n"
-
+                plain += f"{i}. {r.get('Subject','?')} | {r.get('Sender','?')} | {r.get('Status','?')}\n"
+                plain += f"   Action: {r.get('Action','')}\n\n"
         else:
-            report += "Dear Team,\n\n"
-            report += f"Good morning. This is your daily email monitoring report for {today}.\n\n"
-            report += "As of " + time_now + " Baku time, there are no outstanding emails or open action items "
-            report += "requiring your attention. All monitored threads are either closed or have received responses.\n\n"
-            report += "Should you have any queries or wish to submit documents for review, "
-            report += "please send them directly to internal@scope-iq.io and Alex will respond immediately.\n\n"
-
-        report += "=" * 60 + "\n"
-        report += "This report is generated automatically by SCOPE IQ every morning at 09:00 Baku time.\n"
-        report += "Chase protocol: Reminder 1 at day 3, Reminder 2 at day 7, Escalation at day 14, Auto-close at day 21.\n"
-        report += "=" * 60 + "\n\n"
-        report += "Kind regards,\n\n"
-        report += "Alex Rivera\n"
-        report += "Construction Expert\n"
-        report += "SCOPE Consulting MMC\n"
-        report += "internal@scope-iq.io\n"
-        report += "SCOPE IQ — Intelligent Email Monitoring"
+            plain += "All clear — no outstanding items.\n\n"
+        plain += "Alex Rivera | SCOPE Consulting MMC | internal@scope-iq.io"
 
         subject_line = f"SCOPE IQ Daily Report — {today}"
         if pending:
             subject_line += f" — {len(pending)} Open Item(s)"
         else:
-            subject_line += " — All Clear"
+            subject_line += " — All Clear ✓"
 
-        send_email(REPORT_RECIPIENTS, subject_line, report)
+        send_email(
+            REPORT_RECIPIENTS,
+            subject_line,
+            plain,
+            html_body=html_body
+        )
         logger.info("Morning report sent")
 
     except Exception as e:
@@ -931,7 +988,7 @@ def main():
     logger.info("Alex Email Service starting")
     logger.info(f"Monitoring: {ZOHO_EMAIL}")
     logger.info(f"Authorised team: {SCOPE_TEAM_EMAILS}")
-    logger.info(f"Chase protocol: Day {REMINDER_1_DAYS} / {REMINDER_2_DAYS} / {REMINDER_3_DAYS} / Close {AUTO_CLOSE_DAYS}")
+    logger.info(f"Chase protocol: Day {REMINDER_1_DAYS}/{REMINDER_2_DAYS}/{REMINDER_3_DAYS}/Close {AUTO_CLOSE_DAYS}")
 
     load_processed_ids()
     logger.info("Duplicate protection active")
