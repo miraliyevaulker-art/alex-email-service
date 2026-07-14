@@ -23,6 +23,7 @@ MODEL             = "claude-haiku-4-5-20251001"
 
 IMAP_HOST        = "imappro.zoho.com"
 IMAP_PORT        = 993
+IMAP_TIMEOUT     = 30
 REMINDER_1_DAYS  = 3
 REMINDER_2_DAYS  = 7
 REMINDER_3_DAYS  = 14
@@ -109,6 +110,22 @@ internal@scope-iq.io
 
 BAKU MARKET RATES:
 Mechanical excavation 8 to 15 AZN per cubic metre, Manual excavation 60 to 90 AZN per cubic metre, Concrete C25/30 190 to 240 AZN per cubic metre, Reinforcement 1200 to 1500 AZN per tonne, Formwork 18 to 28 AZN per square metre, External brickwork 25 to 40 AZN per square metre, Internal brickwork 20 to 32 AZN per square metre, Plastering 16 to 24 AZN per square metre, Paint 12 to 18 AZN per square metre, Ceramic tiles 25 to 40 AZN per square metre, Premium tiles 45 to 80 AZN per square metre, Gypsum partition 32 to 48 AZN per square metre, Armstrong ceiling 28 to 42 AZN per square metre, Raised access floor 55 to 85 AZN per square metre, Epoxy floor 35 to 55 AZN per square metre, Carpet tiles 40 to 70 AZN per square metre, Aluminium glazing 180 to 280 AZN per square metre, Timber door 350 to 550 AZN each, Fire door 600 to 1200 AZN each, Metal door 4500 to 6500 AZN each, Aluminium door 700 to 900 AZN each, HVAC ductwork 45 to 75 AZN per square metre, Fan coil unit 350 to 600 AZN each, Chiller 120 to 200 AZN per kW, AHU 800 to 2500 AZN each, VAV box 250 to 600 AZN each, Grille and diffuser 35 to 85 AZN each, Duct insulation 15 to 28 AZN per square metre, Plumbing pipework 25 to 55 AZN per metre, Sanitary fixture 180 to 450 AZN each, Pump 800 to 3500 AZN each, Cable tray 35 to 65 AZN per metre, LV cable 8 to 25 AZN per metre, Distribution board 800 to 3500 AZN each, Lighting fixture 45 to 120 AZN each, Emergency lighting 80 to 180 AZN each, Socket and switch 25 to 65 AZN each, Fire alarm panel 1500 to 8000 AZN each, Smoke detector 45 to 120 AZN each, Sprinkler head 25 to 55 AZN each, Sprinkler pipework 18 to 45 AZN per metre, Fire pump 3500 to 12000 AZN each, Access control 800 to 2500 AZN per door, CCTV camera 250 to 600 AZN each, Structured cabling point 85 to 180 AZN each, Concrete paving 35 to 55 AZN per square metre, Natural stone paving 85 to 150 AZN per square metre, Passenger lift 45000 to 80000 AZN each, Freight lift 60000 to 120000 AZN each."""
+
+
+def get_imap_connection():
+    """Create IMAP connection with timeout set"""
+    mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+    mail.socket().settimeout(IMAP_TIMEOUT)
+    mail.login(ZOHO_EMAIL, ZOHO_APP_PASSWORD)
+    return mail
+
+
+def safe_logout(mail):
+    """Logout without raising on socket errors — connection may already be closed"""
+    try:
+        mail.logout()
+    except Exception:
+        pass
 
 
 def get_gspread_client():
@@ -696,7 +713,6 @@ def get_action_data_from_row(row):
 
 
 def build_cc_for_external(action_data):
-    """CC = all MOM thread participants except the external recipient and Alex"""
     resp_email = action_data["email"].lower()
     cc_list    = []
     for addr in action_data["all_participants"]:
@@ -719,10 +735,6 @@ def get_all_domain_emails(domain, all_participants):
 
 def route_external_reply_for_approval(sender, subject, body,
                                       action_data, msg_id_hdr):
-    """
-    Route an external party reply to internal team for approval.
-    NEVER reply directly to external party.
-    """
     analysis   = analyse_external_reply(action_data["action"], body)
     mom_sender = action_data["mom_sender"]
     cc_list    = [r for r in REPORT_RECIPIENTS
@@ -730,7 +742,6 @@ def route_external_reply_for_approval(sender, subject, body,
     resp_label = action_data["responsible_name"] or action_data["responsible"]
 
     if analysis.get("satisfied"):
-        # Action satisfied — notify internal team
         update_action_row(action_data["row"], status="Closed",
                           external_reply=body[:300],
                           notes=analysis.get("analysis", ""))
@@ -751,7 +762,6 @@ def route_external_reply_for_approval(sender, subject, body,
         logger.info(f"Action closed — notified internal team")
 
     else:
-        # Not satisfied — draft follow-up for internal approval
         outstanding = analysis.get("outstanding_items", "")
         draft = draft_external_reminder(
             action_data["action"],
@@ -892,12 +902,8 @@ def process_mom_email(sender, subject, body, attachments,
 
 
 def check_external_action_replies():
-    """
-    Check inbox for external replies.
-    Alex is CC'd so he sees them.
-    NEVER reply directly — always route to internal for approval.
-    """
     logger.info("Checking external action replies...")
+    mail = None
     try:
         sheet = get_action_tracker_sheet()
         if not sheet:
@@ -919,12 +925,11 @@ def check_external_action_replies():
         if not open_actions:
             return
 
-        mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
-        mail.login(ZOHO_EMAIL, ZOHO_APP_PASSWORD)
+        mail = get_imap_connection()
         mail.select("INBOX")
         typ, data = mail.search(None, "ALL")
         if typ != "OK" or not data or not data[0]:
-            mail.logout()
+            safe_logout(mail)
             return
 
         for eid in data[0].split()[-100:]:
@@ -936,9 +941,7 @@ def check_external_action_replies():
                 in_reply_to = safe_decode(msg.get("In-Reply-To", "")).strip()
                 references  = safe_decode(msg.get("References",  "")).strip()
                 from_addr   = extract_email_address(msg.get("From", ""))
-                msg_id_hdr  = safe_decode(msg.get("Message-ID", "")).strip()
 
-                # Only process external emails — never internal or Alex
                 if ZOHO_EMAIL.lower() in from_addr:
                     continue
                 if is_internal_email(from_addr):
@@ -949,24 +952,36 @@ def check_external_action_replies():
                                       thread_id in references):
                         reply_body = get_email_body(msg)
                         logger.info(f"External reply from {from_addr} — routing for approval")
-                        # NEVER reply directly — always route to internal
                         route_external_reply_for_approval(
                             from_addr,
                             safe_decode(msg.get("Subject", "")),
-                            reply_body, action_data, msg_id_hdr
+                            reply_body, action_data,
+                            safe_decode(msg.get("Message-ID", "")).strip()
                         )
+            except (imaplib.IMAP4.abort, OSError, EOFError) as fetch_err:
+                logger.warning(f"Fetch error — reconnecting: {fetch_err}")
+                safe_logout(mail)
+                try:
+                    mail = get_imap_connection()
+                    mail.select("INBOX")
+                except Exception as reconnect_err:
+                    logger.error(f"Reconnect failed: {reconnect_err}")
+                    break
+                continue
             except Exception as e:
                 logger.error(f"Reply check error: {e}")
                 continue
 
-        mail.logout()
+        safe_logout(mail)
     except Exception as e:
         logger.error(f"External reply check error: {e}")
+        if mail:
+            safe_logout(mail)
 
 
 def check_action_approvals():
-    """Detect internal approval — send to external with full MOM CC"""
     logger.info("Checking action approvals...")
+    mail = None
     try:
         sheet = get_action_tracker_sheet()
         if not sheet:
@@ -985,12 +1000,11 @@ def check_action_approvals():
         if not pending_approvals:
             return
 
-        mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
-        mail.login(ZOHO_EMAIL, ZOHO_APP_PASSWORD)
+        mail = get_imap_connection()
         mail.select("INBOX")
         typ, data = mail.search(None, "ALL")
         if typ != "OK" or not data or not data[0]:
-            mail.logout()
+            safe_logout(mail)
             return
 
         for eid in data[0].split()[-50:]:
@@ -1022,7 +1036,6 @@ def check_action_approvals():
                             reminder_count
                         )
                         if draft and action_data["email"] not in ["UNKNOWN", ""]:
-                            # If name unknown — send to all emails from same domain
                             if not action_data["responsible_name"]:
                                 domain    = action_data["email"].split("@")[-1] if "@" in action_data["email"] else ""
                                 all_to    = get_all_domain_emails(domain, action_data["all_participants"])
@@ -1048,17 +1061,28 @@ def check_action_approvals():
                                     draft_sent=datetime.now().strftime("%d.%m.%Y %H:%M")
                                 )
                                 logger.info(f"Approved — sent to {to_emails} CC {cc_list}")
+            except (imaplib.IMAP4.abort, OSError, EOFError) as fetch_err:
+                logger.warning(f"Fetch error — reconnecting: {fetch_err}")
+                safe_logout(mail)
+                try:
+                    mail = get_imap_connection()
+                    mail.select("INBOX")
+                except Exception as reconnect_err:
+                    logger.error(f"Reconnect failed: {reconnect_err}")
+                    break
+                continue
             except Exception as e:
                 logger.error(f"Approval check error: {e}")
                 continue
 
-        mail.logout()
+        safe_logout(mail)
     except Exception as e:
         logger.error(f"Action approval check error: {e}")
+        if mail:
+            safe_logout(mail)
 
 
 def check_external_action_reminders():
-    """Chase protocol — drafts always go to MOM sender for approval first"""
     logger.info("Checking external action reminders...")
     try:
         sheet = get_action_tracker_sheet()
@@ -1131,7 +1155,6 @@ def check_external_action_reminders():
                 )
 
                 if draft:
-                    # Determine To recipients
                     if not data["responsible_name"]:
                         domain    = data["email"].split("@")[-1] if "@" in data["email"] else ""
                         all_to    = get_all_domain_emails(domain, data["all_participants"])
@@ -1176,13 +1199,13 @@ def check_thread_replies(thread_ids):
     replied_threads = set()
     if not thread_ids:
         return replied_threads
+    mail = None
     try:
-        mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
-        mail.login(ZOHO_EMAIL, ZOHO_APP_PASSWORD)
+        mail = get_imap_connection()
         mail.select("INBOX")
         typ, data = mail.search(None, "ALL")
         if typ != "OK" or not data or not data[0]:
-            mail.logout()
+            safe_logout(mail)
             return replied_threads
         for eid in data[0].split()[-100:]:
             try:
@@ -1198,11 +1221,22 @@ def check_thread_replies(thread_ids):
                 for tid in thread_ids:
                     if tid and (tid in in_reply_to or tid in references):
                         replied_threads.add(tid)
+            except (imaplib.IMAP4.abort, OSError, EOFError) as fetch_err:
+                logger.warning(f"Fetch error — reconnecting: {fetch_err}")
+                safe_logout(mail)
+                try:
+                    mail = get_imap_connection()
+                    mail.select("INBOX")
+                except Exception:
+                    break
+                continue
             except:
                 continue
-        mail.logout()
+        safe_logout(mail)
     except Exception as e:
         logger.error(f"Check replies error: {e}")
+        if mail:
+            safe_logout(mail)
     return replied_threads
 
 
@@ -1723,20 +1757,20 @@ def build_report_html(pending, closed, today, day_name, time_now,
 def process_emails():
     logger.info("Checking emails via IMAP...")
     load_processed_ids()
+    mail = None
     try:
-        mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
-        mail.login(ZOHO_EMAIL, ZOHO_APP_PASSWORD)
+        mail = get_imap_connection()
         logger.info("IMAP login successful")
         mail.select("INBOX")
 
         typ, data = mail.search(None, "ALL")
         if typ != "OK" or not data or not data[0]:
-            mail.logout()
+            safe_logout(mail)
             return
 
         all_ids = data[0].split()
         if not all_ids:
-            mail.logout()
+            safe_logout(mail)
             return
 
         recent    = all_ids[-50:]
@@ -1745,10 +1779,25 @@ def process_emails():
 
         for eid in reversed(recent):
             try:
-                eid_str       = eid.decode() if isinstance(eid, bytes) else str(eid)
-                typ, msg_data = mail.fetch(eid, "(RFC822)")
-                if typ != "OK" or not msg_data or not msg_data[0]:
-                    continue
+                eid_str = eid.decode() if isinstance(eid, bytes) else str(eid)
+
+                try:
+                    typ, msg_data = mail.fetch(eid, "(RFC822)")
+                    if typ != "OK" or not msg_data or not msg_data[0]:
+                        continue
+                except (imaplib.IMAP4.abort, OSError, EOFError) as fetch_err:
+                    logger.warning(f"Fetch error on {eid_str} — reconnecting: {fetch_err}")
+                    safe_logout(mail)
+                    try:
+                        mail = get_imap_connection()
+                        mail.select("INBOX")
+                        typ, msg_data = mail.fetch(eid, "(RFC822)")
+                        if typ != "OK" or not msg_data or not msg_data[0]:
+                            continue
+                    except Exception as reconnect_err:
+                        logger.error(f"Reconnect failed: {reconnect_err}")
+                        break
+
                 raw = msg_data[0][1]
                 if not raw:
                     continue
@@ -1799,10 +1848,8 @@ def process_emails():
 
                 logger.info(f"Processing: {sender} | {subject}")
 
-                # ── CC'd email ──────────────────────────────────────────────
                 if is_cc_email:
                     if is_internal and is_mom_email(subject, body, attachments):
-                        # MOM from internal — extract external actions
                         logger.info(f"MOM in CC from internal — extracting actions")
                         all_with_names = []
                         seen = set()
@@ -1813,7 +1860,6 @@ def process_emails():
                         process_mom_email(sender, subject, body,
                                           attachments, all_with_names, msg_id_hdr)
                     else:
-                        # Regular CC — silent analysis only, never reply
                         logger.info(f"CC — silent log: {sender}")
                         analysis = analyse_email(sender, subject, body,
                                                  attachments=attachments,
@@ -1824,10 +1870,8 @@ def process_emails():
                                                analysis[:400], analysis[:500],
                                                msg_id_hdr, "Monitoring")
 
-                # ── Direct from internal ────────────────────────────────────
                 elif is_direct and is_internal:
                     if is_mom_email(subject, body, attachments):
-                        # MOM sent directly to Alex
                         logger.info(f"MOM direct from internal — extracting actions")
                         all_with_names = []
                         seen = set()
@@ -1841,7 +1885,6 @@ def process_emails():
                                        "MOM processed — see Action Tracker",
                                        "Review Action Tracker", "Closed")
                     else:
-                        # Regular direct from internal — reply normally
                         analysis = analyse_email(sender, subject, body,
                                                  attachments=attachments,
                                                  memory_files=memory_files,
@@ -1864,20 +1907,16 @@ def process_emails():
                                            "Replied by Alex",
                                            "Closed" if sent else "Open")
 
-                # ── Direct from external ────────────────────────────────────
                 elif is_direct and is_external:
                     logger.info(f"External direct to Alex: {sender}")
-                    # Check if this is a reply to a tracked action
                     matched_action = find_action_by_thread(in_reply_to, references)
 
                     if matched_action:
-                        # Route to internal for approval — NEVER reply to external
                         logger.info(f"Matched action — routing for internal approval")
                         route_external_reply_for_approval(
                             sender, subject, body, matched_action, msg_id_hdr
                         )
                     else:
-                        # Unknown external email — log silently
                         logger.info(f"Unknown external direct — logging silently")
                         save_to_monitoring(
                             sender, subject,
@@ -1890,13 +1929,17 @@ def process_emails():
                 logger.error(f"Email error: {e}")
                 continue
 
-        mail.logout()
+        safe_logout(mail)
         logger.info(f"Done — {new_count} new emails processed")
 
     except imaplib.IMAP4.error as e:
         logger.error(f"IMAP auth error: {e}")
+        if mail:
+            safe_logout(mail)
     except Exception as e:
         logger.error(f"IMAP error: {e}")
+        if mail:
+            safe_logout(mail)
 
 
 def send_morning_report():
