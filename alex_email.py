@@ -113,7 +113,6 @@ Mechanical excavation 8 to 15 AZN per cubic metre, Manual excavation 60 to 90 AZ
 
 
 def get_imap_connection():
-    """Create IMAP connection with timeout set"""
     mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
     mail.socket().settimeout(IMAP_TIMEOUT)
     mail.login(ZOHO_EMAIL, ZOHO_APP_PASSWORD)
@@ -121,7 +120,6 @@ def get_imap_connection():
 
 
 def safe_logout(mail):
-    """Logout without raising on socket errors — connection may already be closed"""
     try:
         mail.logout()
     except Exception:
@@ -168,15 +166,6 @@ def get_or_create_sheet(title, rows=1000, cols=5):
 
 
 def get_action_tracker_sheet():
-    """
-    Columns:
-    1  Date Logged        2  Meeting Reference   3  Action Item
-    4  Responsible Party  5  Responsible Email   6  Due Date
-    7  Status             8  Last Reminded       9  Reminder Count
-    10 Thread ID          11 MOM Sender          12 Draft Sent
-    13 External Reply     14 Notes               15 All Thread Participants
-    16 Client Emails      17 Responsible Name
-    """
     try:
         client      = get_gspread_client()
         spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
@@ -526,7 +515,6 @@ def classify_thread_participants(all_participants_with_names):
 
 
 def find_action_by_thread(in_reply_to, references):
-    """Find matching open action in tracker by thread references"""
     try:
         sheet = get_action_tracker_sheet()
         if not sheet:
@@ -644,7 +632,7 @@ Respond in this exact JSON only:
 
 def draft_external_reminder(action_item, responsible_name, responsible_party,
                              due_date, meeting_ref, reminder_number,
-                             outstanding=None):
+                             outstanding=None, on_behalf_of=None):
     try:
         tone_map = {1: "polite and professional",
                     2: "firm and urgent",
@@ -657,6 +645,7 @@ def draft_external_reminder(action_item, responsible_name, responsible_party,
             salutation = f"Dear {company} Team,"
 
         outstanding_text = f"\n\nOutstanding items:\n{outstanding}" if outstanding else ""
+        on_behalf_line = f" writing on behalf of {on_behalf_of}, SCOPE Consulting MMC" if on_behalf_of else ""
 
         prompt = f"""Draft a {tone_map.get(reminder_number, 'formal')} reminder email to an external party.
 
@@ -668,6 +657,7 @@ Due date: {due_date}
 Reminder number: {reminder_number} of 3{outstanding_text}
 
 Start with exactly: {salutation}
+In the opening sentence, mention you are{on_behalf_line}, following up on the referenced meeting.
 Write complete formal professional email. No bullet points or symbols.
 End with:
 Alex Rivera
@@ -768,7 +758,8 @@ def route_external_reply_for_approval(sender, subject, body,
             action_data["responsible_name"],
             action_data["responsible"],
             "As previously agreed",
-            action_data["meeting_ref"], 1, outstanding
+            action_data["meeting_ref"], 1, outstanding,
+            on_behalf_of=get_first_name(mom_sender)
         )
         if draft:
             approval  = f"Dear {get_first_name(mom_sender)},\n\n"
@@ -1033,7 +1024,8 @@ def check_action_approvals():
                             action_data["responsible"],
                             action_data["due_date"],
                             action_data["meeting_ref"],
-                            reminder_count
+                            reminder_count,
+                            on_behalf_of=get_first_name(action_data["mom_sender"])
                         )
                         if draft and action_data["email"] not in ["UNKNOWN", ""]:
                             if not action_data["responsible_name"]:
@@ -1043,13 +1035,26 @@ def check_action_approvals():
                             else:
                                 to_emails = [action_data["email"]]
 
-                            cc_list = build_cc_for_external(action_data)
+                            cc_list      = build_cc_for_external(action_data)
+                            resp_label   = action_data["responsible_name"] or action_data["responsible"]
+                            reminder_tag = {1: "Follow-up", 2: "Second Follow-up",
+                                            3: "Escalation Notice"}.get(reminder_count, "Follow-up")
+
+                            html_reminder = build_external_reminder_html(
+                                draft,
+                                action_data["meeting_ref"],
+                                action_data["action"],
+                                resp_label,
+                                action_data["due_date"],
+                                reminder_tag,
+                                on_behalf_of=get_first_name(action_data["mom_sender"])
+                            )
 
                             sent = send_email(
                                 to_emails,
                                 f"Action Item Follow-up — {action_data['meeting_ref']}",
                                 draft,
-                                html_body=build_reply_html(draft),
+                                html_body=html_reminder,
                                 cc_emails=cc_list
                             )
                             if sent:
@@ -1151,7 +1156,8 @@ def check_external_action_reminders():
                 draft = draft_external_reminder(
                     data["action"], data["responsible_name"],
                     data["responsible"], data["due_date"],
-                    data["meeting_ref"], reminder_due
+                    data["meeting_ref"], reminder_due,
+                    on_behalf_of=get_first_name(data["mom_sender"])
                 )
 
                 if draft:
@@ -1600,6 +1606,105 @@ def build_reply_html(body_text):
   </div>
 </div>
 </body></html>"""
+
+
+def build_external_reminder_html(body_text, meeting_ref, action_item,
+                                  responsible_label, due_date,
+                                  reminder_label="Follow-up", on_behalf_of=None):
+    """
+    Branded HTML for external follow-up emails — matches the daily report style
+    (navy header, stats-style bar, structured action card).
+    """
+    today    = datetime.now().strftime("%d %B %Y")
+    time_now = datetime.now().strftime("%H:%M")
+
+    paragraphs = body_text.strip().split("\n\n")
+    html_body  = ""
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        if "Alex Rivera" in para and "SCOPE Consulting" in para:
+            lines    = para.split("\n")
+            sig_html = ""
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                if "Alex Rivera" in line:
+                    sig_html += f'<div style="font-size:13px;font-weight:600;color:#1a2942;">{line}</div>'
+                elif "internal@scope-iq.io" in line:
+                    sig_html += f'<div style="font-size:12px;color:#3CB496;">{line}</div>'
+                else:
+                    sig_html += f'<div style="font-size:12px;color:#666;">{line}</div>'
+            html_body += f'<div style="margin-top:20px;padding-top:16px;border-top:1px solid #f0f0f0;line-height:1.8;">{sig_html}</div>'
+        else:
+            lines     = para.split("\n")
+            para_html = "<br>".join(line.strip() for line in lines if line.strip())
+            html_body += f'<p style="font-size:14px;color:#333;line-height:1.8;margin:0 0 16px;">{para_html}</p>'
+
+    badge_color = "#f0a030" if reminder_label == "Follow-up" else \
+                  "#e07030" if reminder_label == "Second Follow-up" else "#c00000"
+
+    from_label = f"Alex Rivera on behalf of {on_behalf_of}" if on_behalf_of else "Alex Rivera"
+
+    return f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif;">
+<div style="max-width:620px;margin:0 auto;padding:20px 0;">
+
+  <div style="background:#1a2942;border-radius:12px 12px 0 0;padding:24px 28px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <div style="color:#fff;font-size:22px;font-weight:600;letter-spacing:1px;">SCOPE <span style="color:#3CB496;">IQ</span></div>
+      <div style="background:{badge_color};color:#fff;font-size:11px;padding:4px 12px;border-radius:20px;font-weight:500;">{reminder_label}</div>
+    </div>
+    <table style="width:100%;font-size:12px;border-collapse:collapse;">
+      <tr>
+        <td style="color:#8facc8;padding:2px 0;width:50%;">Date &nbsp;<strong style="color:#c8ddf0;">{today}</strong></td>
+        <td style="color:#8facc8;padding:2px 0;">Time &nbsp;<strong style="color:#c8ddf0;">{time_now} Baku</strong></td>
+      </tr>
+      <tr>
+        <td style="color:#8facc8;padding:2px 0;">From &nbsp;<strong style="color:#c8ddf0;">{from_label}</strong></td>
+        <td style="color:#8facc8;padding:2px 0;">Meeting ref &nbsp;<strong style="color:#c8ddf0;">{meeting_ref}</strong></td>
+      </tr>
+    </table>
+  </div>
+
+  <div style="background:#243550;padding:16px 28px;">
+    <div style="font-size:11px;color:#8facc8;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">Action item under follow-up</div>
+    <div style="font-size:14px;color:#fff;font-weight:600;line-height:1.5;">{action_item}</div>
+  </div>
+
+  <div style="background:#fff;border:1px solid #e8e8e8;border-top:none;border-radius:0 0 12px 12px;padding:24px 28px;">
+
+    <div style="border:1px solid #e8e8e8;border-radius:8px;margin-bottom:20px;overflow:hidden;">
+      <div style="background:#f8f9fa;padding:10px 16px;border-bottom:1px solid #e8e8e8;">
+        <span style="font-size:12px;color:#888;font-weight:500;">ACTION DETAILS</span>
+      </div>
+      <div style="padding:14px 16px;">
+        <table style="width:100%;font-size:13px;border-collapse:collapse;">
+          <tr><td style="color:#888;padding:4px 0;width:130px;">Responsible</td><td style="color:#1a2942;font-weight:600;">{responsible_label}</td></tr>
+          <tr><td style="color:#888;padding:4px 0;">Due date</td><td style="color:#333;">{due_date}</td></tr>
+          <tr><td style="color:#888;padding:4px 0;">Meeting reference</td><td style="color:#333;">{meeting_ref}</td></tr>
+        </table>
+      </div>
+    </div>
+
+    {html_body}
+
+    <div style="background:#f8f9fa;border-radius:6px;padding:10px 14px;margin-top:16px;">
+      <div style="font-size:11px;color:#888;line-height:1.6;">
+        This follow-up was prepared by <strong style="color:#1a2942;">{from_label}</strong>,
+        Construction Expert at SCOPE Consulting MMC, using
+        <strong style="color:#3CB496;">SCOPE IQ</strong> — Intelligent Email Monitoring.
+      </div>
+    </div>
+
+  </div>
+</div>
+</body>
+</html>"""
 
 
 def build_report_html(pending, closed, today, day_name, time_now,
