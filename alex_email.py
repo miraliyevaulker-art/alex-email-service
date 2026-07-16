@@ -400,7 +400,7 @@ def read_actions_for_report():
             open_actions = [r for r in records if r.get("Status") in
                             ["Open", "Draft Pending", "Draft Sent", "Reminded"]]
             closed       = [r for r in records if r.get("Status") in
-                            ["Closed", "Closed — No Response"]]
+                            ["Closed", "Closed — No Response", "Closed — No Action Required"]]
             flagged      = [r for r in records if r.get("Status") == "Email Unknown"]
             return open_actions, closed, flagged
         return [], [], []
@@ -435,6 +435,25 @@ def is_approval_reply(body_text):
         "please send", "send it", "agreed"
     ]
     return any(kw in body_text.lower() for kw in approval_keywords)
+
+
+def is_rejection_reply(body_text):
+    """
+    Detect if internal team is telling Alex to STOP / CLOSE / NOT PROCEED
+    with a MOM action or draft. Checked BEFORE approval keywords since
+    phrases like 'no need' do not overlap with approval terms, but we
+    still want rejection to take priority in ambiguous cases.
+    """
+    rejection_keywords = [
+        "no need", "not needed", "not required", "no longer required",
+        "close this", "close it", "please close", "disregard",
+        "ignore this", "not necessary", "cancel this", "cancel it",
+        "reject", "no action required", "not applicable", "n/a",
+        "drop this", "stop this", "no longer relevant", "obsolete",
+        "already resolved", "already closed", "already handled"
+    ]
+    text = body_text.lower()
+    return any(kw in text for kw in rejection_keywords)
 
 
 def is_mom_email(subject, body, attachments):
@@ -525,7 +544,7 @@ def find_action_by_thread(in_reply_to, references):
                 continue
             thread_id = row[9].strip() if len(row) > 9 else ""
             status    = row[6].strip() if len(row) > 6 else ""
-            if not thread_id or status in ["Closed", "Closed — No Response"]:
+            if not thread_id or status in ["Closed", "Closed — No Response", "Closed — No Action Required"]:
                 continue
             if thread_id in in_reply_to or thread_id in references:
                 data = get_action_data_from_row(row)
@@ -534,6 +553,27 @@ def find_action_by_thread(in_reply_to, references):
     except Exception as e:
         logger.error(f"Find action error: {e}")
         return None
+
+
+def find_all_actions_by_thread(thread_id):
+    """Find ALL non-closed action rows sharing this thread_id (a MOM can have multiple actions)"""
+    matches = []
+    try:
+        sheet = get_action_tracker_sheet()
+        if not sheet:
+            return matches
+        all_values = sheet.get_all_values()
+        for i, row in enumerate(all_values[1:], start=2):
+            if len(row) < 10:
+                continue
+            tid    = row[9].strip() if len(row) > 9 else ""
+            status = row[6].strip() if len(row) > 6 else ""
+            if tid == thread_id and status not in ["Closed", "Closed — No Response", "Closed — No Action Required"]:
+                data = get_action_data_from_row(row)
+                matches.append({"row": i, **data})
+    except Exception as e:
+        logger.error(f"Find all actions error: {e}")
+    return matches
 
 
 def extract_mom_actions(mom_content, thread_participants_with_names, subject):
@@ -748,7 +788,9 @@ def route_external_reply_for_approval(sender, subject, body,
                    f"Action Closed — {action_data['action'][:50]}",
                    notice,
                    html_body=build_reply_html(notice),
-                   cc_emails=cc_list)
+                   cc_emails=cc_list,
+                   reply_to_msg_id=action_data["thread_id"],
+                   references=action_data["thread_id"])
         logger.info(f"Action closed — notified internal team")
 
     else:
@@ -768,7 +810,7 @@ def route_external_reply_for_approval(sender, subject, body,
             approval += f"Action: {action_data['action']}\n\n"
             approval += f"My assessment:\n{analysis.get('analysis', '')}\n\n"
             approval += f"Outstanding items:\n{outstanding}\n\n"
-            approval += f"I have prepared a follow-up email for your approval. Please reply with approve or send and I will dispatch it to {resp_label} immediately.\n\n"
+            approval += f"I have prepared a follow-up email for your approval. Please reply with approve or send and I will dispatch it to {resp_label} immediately. If no further action is required please reply no need and I will close this item.\n\n"
             approval += f"{'='*50}\nDRAFT FOLLOW-UP TO {resp_label.upper()}:\n{'='*50}\n\n{draft}\n\n{'='*50}\n\n"
             approval += f"Kind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
 
@@ -781,7 +823,9 @@ def route_external_reply_for_approval(sender, subject, body,
                        f"Approval Required — Follow-up to {resp_label}",
                        approval,
                        html_body=build_reply_html(approval),
-                       cc_emails=cc_list)
+                       cc_emails=cc_list,
+                       reply_to_msg_id=action_data["thread_id"],
+                       references=action_data["thread_id"])
             logger.info(f"Draft follow-up sent to {mom_sender} for approval")
 
 
@@ -813,6 +857,7 @@ def process_mom_email(sender, subject, body, attachments,
         return
 
     unknown_count = 0
+    action_rows = []
     for action in actions:
         resp_email = action.get("responsible_email", "UNKNOWN")
         resp_name  = action.get("responsible_name", "")
@@ -829,67 +874,292 @@ def process_mom_email(sender, subject, body, attachments,
             msg_id_hdr, sender,
             all_participants, client_emails, status
         )
+        action_rows.append({**action, "status": status})
 
-    def fmt_p(lst):
-        if not lst:
-            return "None detected"
-        return "\n".join([
-            f"  {p['name']} <{p['email']}>" if p['name'] else f"  {p['email']}"
-            for p in lst
-        ])
+    # Branded, card-style confirmation email — threaded back to the MOM
+    html_confirmation = build_mom_confirmation_html(
+        sender, meeting_ref, action_rows,
+        client_id, contractor_id, internal, clients, contractors,
+        unknown_count
+    )
 
-    party_analysis  = f"My analysis of the parties in this meeting:\n\n"
-    party_analysis += f"Client identified from MOM: {client_id}\n"
-    if clients:
-        party_analysis += f"Client contacts:\n{fmt_p(clients)}\n"
-        party_analysis += f"These parties will be CC'd on all follow-up emails for awareness and will never receive direct action requests.\n\n"
-    else:
-        party_analysis += f"No client email addresses detected. If the client should be copied please provide their email.\n\n"
-
-    party_analysis += f"Contractor identified from MOM: {contractor_id}\n"
-    if contractors:
-        party_analysis += f"Contractor contacts:\n{fmt_p(contractors)}\n"
-        party_analysis += f"These parties will receive action follow-up emails after your approval.\n\n"
-    else:
-        party_analysis += f"No contractor email addresses detected. Please provide contact details.\n\n"
-
-    party_analysis += f"SCOPE team:\n{fmt_p(internal)}\n"
-    party_analysis += f"These parties will be CC'd on all outgoing emails.\n\n"
-
-    if unknown_count:
-        party_analysis += f"Note: {unknown_count} action(s) could not be matched to an email address. Please provide the correct contact details.\n\n"
-
-    action_summary = ""
+    # Plain text fallback (kept simple; the HTML carries the design)
+    plain = f"MOM Action Items — Confirmation Required — {meeting_ref}\n\n"
+    plain += f"Client identified: {client_id}\nContractor identified: {contractor_id}\n\n"
     for i, action in enumerate(actions, 1):
-        role_tag = f"[{action.get('party_role', 'CONTRACTOR')}]"
-        name     = action.get("responsible_name", "")
-        party    = action.get("responsible_party", "Unknown")
-        label    = f"{name} ({party})" if name else party
-        action_summary += f"{i}. {role_tag} Action: {action.get('action', '')}\n"
-        action_summary += f"   Responsible: {label}\n"
-        action_summary += f"   Email: {action.get('responsible_email', 'UNKNOWN')}\n"
-        action_summary += f"   Due: {action.get('due_date', 'Not specified')}\n\n"
-
-    notification  = f"Dear {get_first_name(sender)},\n\n"
-    notification += f"I have analysed the Minutes of Meeting and extracted {len(actions)} action item(s) from {meeting_ref}.\n\n"
-    notification += f"{'='*50}\nPARTY IDENTIFICATION — PLEASE CONFIRM\n{'='*50}\n\n"
-    notification += party_analysis
-    notification += f"{'='*50}\nEXTRACTED ACTION ITEMS\n{'='*50}\n\n"
-    notification += action_summary
-    notification += f"{'='*50}\n\n"
-    notification += f"All actions have been logged in the Action Tracker. Draft follow-up reminders will be sent to you for approval before any email is dispatched to external parties.\n\n"
-    notification += f"Please confirm the party identification above is correct by replying with approve or confirmed. If any party is incorrectly identified please advise and I will update before proceeding.\n\n"
-    notification += f"Kind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+        plain += f"{i}. {action.get('action','')} — {action.get('responsible_party','Unknown')} ({action.get('responsible_email','UNKNOWN')})\n"
+    plain += "\nPlease reply approve/confirmed to proceed, or no need to close this item.\n\nAlex Rivera | SCOPE Consulting MMC"
 
     cc_approval = [r for r in REPORT_RECIPIENTS if r.lower() != sender.lower()]
+
+    # Thread this back to the original MOM message so replies (approve / no need)
+    # are correctly matched to these action rows.
     send_email(
         [sender],
         f"MOM Action Items — Confirmation Required — {meeting_ref}",
-        notification,
-        html_body=build_reply_html(notification),
-        cc_emails=cc_approval
+        plain,
+        html_body=html_confirmation,
+        cc_emails=cc_approval,
+        reply_to_msg_id=msg_id_hdr,
+        references=msg_id_hdr
     )
     logger.info(f"MOM notification sent to {sender}")
+
+
+def build_mom_confirmation_html(sender, meeting_ref, actions, client_id,
+                                contractor_id, internal, clients, contractors,
+                                unknown_count):
+    """
+    Branded, card-style confirmation email for newly extracted MOM actions.
+    Matches the visual language of the daily report and external follow-ups.
+    """
+    today    = datetime.now().strftime("%d %B %Y")
+    time_now = datetime.now().strftime("%H:%M")
+
+    def fmt_party_card(title, lst, note, empty_note, accent):
+        if lst:
+            rows = "".join([
+                f'<div style="font-size:12px;color:#333;padding:3px 0;">{p["name"]} &lt;{p["email"]}&gt;</div>'
+                if p["name"] else
+                f'<div style="font-size:12px;color:#333;padding:3px 0;">{p["email"]}</div>'
+                for p in lst
+            ])
+            body = rows + f'<div style="font-size:11px;color:#888;margin-top:6px;">{note}</div>'
+        else:
+            body = f'<div style="font-size:12px;color:#888;">{empty_note}</div>'
+
+        return f"""
+        <div style="border:1px solid #e8e8e8;border-radius:8px;margin-bottom:12px;overflow:hidden;">
+          <div style="background:#f8f9fa;padding:10px 14px;border-left:3px solid {accent};">
+            <span style="font-size:11px;color:#555;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">{title}</span>
+          </div>
+          <div style="padding:12px 14px;">{body}</div>
+        </div>"""
+
+    party_html  = fmt_party_card(
+        f"Client — {client_id}", clients,
+        "CC'd for awareness on all follow-ups. Never sent action requests directly.",
+        "No client email detected in this thread. Please provide if applicable.",
+        "#3CB496"
+    )
+    party_html += fmt_party_card(
+        f"Contractor — {contractor_id}", contractors,
+        "Will receive action follow-up emails once you approve.",
+        "No contractor email detected. Please provide contact details.",
+        "#f0a030"
+    )
+    party_html += fmt_party_card(
+        "SCOPE team", internal,
+        "CC'd on all outgoing correspondence.",
+        "No SCOPE team members detected in thread.",
+        "#1a2942"
+    )
+
+    actions_html = ""
+    for i, a in enumerate(actions, 1):
+        role   = a.get("party_role", "CONTRACTOR")
+        name   = a.get("responsible_name", "")
+        party  = a.get("responsible_party", "Unknown")
+        label  = f"{name} ({party})" if name else party
+        email_ = a.get("responsible_email", "UNKNOWN")
+        due    = a.get("due_date", "Not specified")
+        status = a.get("status", "Open")
+
+        role_bg = {"CLIENT": "#e1f5ee", "SCOPE": "#eef1f6"}.get(role, "#fff8ee")
+        role_tx = {"CLIENT": "#0f6e56", "SCOPE": "#1a2942"}.get(role, "#9a6000")
+        status_bg = "#fff0f0" if status == "Email Unknown" else "#fff8ee"
+        status_tx = "#c00000" if status == "Email Unknown" else "#9a6000"
+
+        actions_html += f"""
+        <div style="border:1px solid #e8e8e8;border-radius:8px;margin-bottom:12px;overflow:hidden;">
+          <div style="background:#f8f9fa;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #e8e8e8;">
+            <span style="font-size:12px;color:#888;">Action {i} of {len(actions)}</span>
+            <div>
+              <span style="background:{role_bg};color:{role_tx};font-size:10px;padding:2px 8px;border-radius:20px;margin-right:6px;">{role}</span>
+              <span style="background:{status_bg};color:{status_tx};font-size:10px;padding:2px 8px;border-radius:20px;">{status}</span>
+            </div>
+          </div>
+          <div style="padding:14px;">
+            <div style="font-size:13px;color:#1a2942;font-weight:600;margin-bottom:8px;">{a.get('action','')}</div>
+            <table style="width:100%;font-size:12px;border-collapse:collapse;">
+              <tr><td style="color:#888;padding:3px 0;width:120px;">Responsible</td><td style="color:#333;">{label}</td></tr>
+              <tr><td style="color:#888;padding:3px 0;">Email</td><td style="color:#333;">{email_}</td></tr>
+              <tr><td style="color:#888;padding:3px 0;">Due date</td><td style="color:#333;">{due}</td></tr>
+            </table>
+          </div>
+        </div>"""
+
+    unknown_banner = ""
+    if unknown_count:
+        unknown_banner = f"""
+        <div style="background:#fff0f0;border:1px solid #f0c0c0;border-radius:6px;padding:10px 14px;margin-bottom:16px;">
+          <div style="font-size:11px;font-weight:600;color:#c00000;margin-bottom:4px;">EMAIL UNKNOWN — ACTION REQUIRED</div>
+          <div style="font-size:12px;color:#800000;">{unknown_count} action(s) could not be matched to a contractor email. Please provide the correct contact details.</div>
+        </div>"""
+
+    return f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif;">
+<div style="max-width:620px;margin:0 auto;padding:20px 0;">
+
+  <div style="background:#1a2942;border-radius:12px 12px 0 0;padding:24px 28px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <div style="color:#fff;font-size:22px;font-weight:600;letter-spacing:1px;">SCOPE <span style="color:#3CB496;">IQ</span></div>
+      <div style="background:#3CB496;color:#fff;font-size:11px;padding:4px 12px;border-radius:20px;font-weight:500;">MOM Action Items</div>
+    </div>
+    <table style="width:100%;font-size:12px;border-collapse:collapse;">
+      <tr>
+        <td style="color:#8facc8;padding:2px 0;width:50%;">Date &nbsp;<strong style="color:#c8ddf0;">{today}</strong></td>
+        <td style="color:#8facc8;padding:2px 0;">Time &nbsp;<strong style="color:#c8ddf0;">{time_now} Baku</strong></td>
+      </tr>
+      <tr>
+        <td style="color:#8facc8;padding:2px 0;">Prepared by &nbsp;<strong style="color:#c8ddf0;">Alex Rivera</strong></td>
+        <td style="color:#8facc8;padding:2px 0;">Meeting ref &nbsp;<strong style="color:#c8ddf0;">{meeting_ref}</strong></td>
+      </tr>
+    </table>
+  </div>
+
+  <div style="background:#243550;padding:12px 28px;">
+    <div style="font-size:11px;color:#8facc8;text-transform:uppercase;letter-spacing:0.5px;">Total actions identified</div>
+    <div style="font-size:22px;color:#fff;font-weight:600;">{len(actions)}</div>
+  </div>
+
+  <div style="background:#fff;border:1px solid #e8e8e8;border-top:none;border-radius:0 0 12px 12px;padding:24px 28px;">
+
+    <p style="font-size:14px;color:#444;line-height:1.7;margin:0 0 16px;">
+      Dear {get_first_name(sender)}, I have analysed the Minutes of Meeting and extracted the action items below. Please review the party identification and confirm.
+    </p>
+
+    <div style="font-size:11px;font-weight:600;color:#888;letter-spacing:1px;text-transform:uppercase;margin-bottom:10px;">Party identification — please confirm</div>
+    {party_html}
+
+    {unknown_banner}
+
+    <div style="font-size:11px;font-weight:600;color:#888;letter-spacing:1px;text-transform:uppercase;margin:20px 0 10px;">Extracted action items</div>
+    {actions_html}
+
+    <div style="background:#f0f7ff;border:1px solid #cfe3fb;border-radius:6px;padding:12px 14px;margin-top:16px;">
+      <div style="font-size:12px;color:#1a4d80;line-height:1.6;">
+        Please reply <strong>approve</strong> or <strong>confirmed</strong> if the party identification above is correct — draft follow-up reminders will then be prepared per the chase protocol before any email is sent externally.
+        If no action is required, please reply <strong>no need</strong> or <strong>close this</strong> and I will close this item immediately with no further reminders.
+      </div>
+    </div>
+
+    <div style="border-top:1px solid #f0f0f0;margin-top:20px;padding-top:16px;">
+      <div style="font-size:13px;font-weight:600;color:#1a2942;">Alex Rivera</div>
+      <div style="font-size:12px;color:#666;">Construction Expert</div>
+      <div style="font-size:12px;color:#666;">SCOPE Consulting MMC</div>
+      <div style="font-size:12px;color:#3CB496;">internal@scope-iq.io</div>
+    </div>
+
+  </div>
+</div>
+</body>
+</html>"""
+
+
+def check_mom_confirmation_and_rejections():
+    """
+    Scans inbox for internal replies to MOM confirmation / draft approval threads.
+    If rejection detected ('no need', 'close this', etc.) — close ALL matching
+    action rows for that thread immediately and stop all chasing.
+    If approval detected — no action needed here (normal flow already proceeds
+    via check_action_approvals for Draft Pending rows).
+    """
+    logger.info("Checking MOM confirmation replies for rejection/approval...")
+    mail = None
+    try:
+        sheet = get_action_tracker_sheet()
+        if not sheet:
+            return
+
+        all_values = sheet.get_all_values()
+        if not all_values or len(all_values) < 2:
+            return
+
+        # Collect distinct thread_ids for any non-closed action
+        open_thread_ids = set()
+        for row in all_values[1:]:
+            if len(row) < 10:
+                continue
+            status    = row[6].strip() if len(row) > 6 else ""
+            thread_id = row[9].strip() if len(row) > 9 else ""
+            if thread_id and status not in ["Closed", "Closed — No Response", "Closed — No Action Required"]:
+                open_thread_ids.add(thread_id)
+
+        if not open_thread_ids:
+            return
+
+        mail = get_imap_connection()
+        mail.select("INBOX")
+        typ, data = mail.search(None, "ALL")
+        if typ != "OK" or not data or not data[0]:
+            safe_logout(mail)
+            return
+
+        for eid in data[0].split()[-100:]:
+            try:
+                typ, msg_data = mail.fetch(eid, "(RFC822)")
+                if typ != "OK" or not msg_data or not msg_data[0]:
+                    continue
+                msg         = email.message_from_bytes(msg_data[0][1])
+                from_addr   = extract_email_address(msg.get("From", ""))
+                in_reply_to = safe_decode(msg.get("In-Reply-To", "")).strip()
+                references  = safe_decode(msg.get("References",  "")).strip()
+
+                if not is_internal_email(from_addr):
+                    continue
+
+                body = get_email_body(msg)
+                if not is_rejection_reply(body):
+                    continue
+
+                for thread_id in list(open_thread_ids):
+                    if thread_id in in_reply_to or thread_id in references:
+                        matches = find_all_actions_by_thread(thread_id)
+                        for m in matches:
+                            update_action_row(
+                                m["row"],
+                                status="Closed — No Action Required",
+                                notes=f"Closed per instruction from {from_addr}"
+                            )
+                        if matches:
+                            open_thread_ids.discard(thread_id)
+                            first_action = matches[0]
+                            notice  = f"Dear Team,\n\n"
+                            notice += f"Per your instruction, the following action item(s) from {first_action['meeting_ref']} have been closed with no further action or follow-up required.\n\n"
+                            for m in matches:
+                                notice += f"- {m['action']}\n"
+                            notice += f"\nNo further reminders will be sent for these items.\n\n"
+                            notice += f"Kind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+                            send_email(
+                                REPORT_RECIPIENTS,
+                                f"Closed — No Action Required — {first_action['meeting_ref']}",
+                                notice,
+                                html_body=build_reply_html(notice)
+                            )
+                            logger.info(f"Closed {len(matches)} action(s) on thread {thread_id} per rejection")
+
+            except (imaplib.IMAP4.abort, OSError, EOFError) as fetch_err:
+                logger.warning(f"Fetch error — reconnecting: {fetch_err}")
+                safe_logout(mail)
+                try:
+                    mail = get_imap_connection()
+                    mail.select("INBOX")
+                except Exception as reconnect_err:
+                    logger.error(f"Reconnect failed: {reconnect_err}")
+                    break
+                continue
+            except Exception as e:
+                logger.error(f"MOM rejection check error: {e}")
+                continue
+
+        safe_logout(mail)
+    except Exception as e:
+        logger.error(f"MOM confirmation/rejection check error: {e}")
+        if mail:
+            safe_logout(mail)
 
 
 def check_external_action_replies():
@@ -1011,6 +1281,27 @@ def check_action_approvals():
 
                 if not is_internal_email(from_addr):
                     continue
+
+                # Rejection takes priority — close instead of send
+                if is_rejection_reply(body):
+                    for thread_id, action_data in pending_approvals.items():
+                        if thread_id and (thread_id in in_reply_to or
+                                          thread_id in references):
+                            update_action_row(
+                                action_data["row"],
+                                status="Closed — No Action Required",
+                                notes=f"Closed per instruction from {from_addr}"
+                            )
+                            notice  = f"Dear Team,\n\n"
+                            notice += f"Per your instruction, the following action item has been closed with no further follow-up.\n\n"
+                            notice += f"Meeting reference: {action_data['meeting_ref']}\nAction: {action_data['action']}\n\n"
+                            notice += f"Kind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+                            send_email(REPORT_RECIPIENTS,
+                                       f"Closed — No Action Required — {action_data['action'][:50]}",
+                                       notice, html_body=build_reply_html(notice))
+                            logger.info(f"Draft cancelled and action closed per rejection: {action_data['action'][:50]}")
+                    continue
+
                 if not is_approval_reply(body):
                     continue
 
@@ -1173,7 +1464,7 @@ def check_external_action_reminders():
                     approval  = f"Dear {get_first_name(data['mom_sender'])},\n\n"
                     approval += f"The action item below from {data['meeting_ref']} has been open for {days_open} days without a response from {resp_label}.\n\n"
                     approval += f"Action: {data['action']}\nResponsible: {resp_label} ({data['email']})\nDue date: {data['due_date']}\n\n"
-                    approval += f"I have prepared a {tone_label.lower()} for your approval. Please reply with approve or send to dispatch.\n\n"
+                    approval += f"I have prepared a {tone_label.lower()} for your approval. Please reply with approve or send to dispatch, or no need to close this item.\n\n"
                     approval += f"When approved this email will be sent:\nTo: {to_preview}\nCC: {', '.join(cc_preview)}\n\n"
                     approval += f"{'='*50}\nDRAFT — {tone_label.upper()} TO {resp_label.upper()}:\n{'='*50}\n\n{draft}\n\n{'='*50}\n\n"
                     approval += f"Kind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
@@ -1186,7 +1477,9 @@ def check_external_action_reminders():
                         f"Approval Required — {tone_label} to {resp_label}",
                         approval,
                         html_body=build_reply_html(approval),
-                        cc_emails=cc
+                        cc_emails=cc,
+                        reply_to_msg_id=data["thread_id"],
+                        references=data["thread_id"]
                     )
                     if sent:
                         update_action_row(i, status="Draft Pending",
@@ -1611,10 +1904,6 @@ def build_reply_html(body_text):
 def build_external_reminder_html(body_text, meeting_ref, action_item,
                                   responsible_label, due_date,
                                   reminder_label="Follow-up", on_behalf_of=None):
-    """
-    Branded HTML for external follow-up emails — matches the daily report style
-    (navy header, stats-style bar, structured action card).
-    """
     today    = datetime.now().strftime("%d %B %Y")
     time_now = datetime.now().strftime("%H:%M")
 
@@ -2087,6 +2376,7 @@ def main():
     schedule.every(6).hours.do(check_external_action_replies)
     schedule.every(6).hours.do(check_action_approvals)
     schedule.every(6).hours.do(check_external_action_reminders)
+    schedule.every(6).hours.do(check_mom_confirmation_and_rejections)
 
     process_emails()
 
