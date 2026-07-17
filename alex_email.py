@@ -444,7 +444,14 @@ def is_rejection_reply(body_text):
         "ignore this", "not necessary", "cancel this", "cancel it",
         "reject", "no action required", "not applicable", "n/a",
         "drop this", "stop this", "no longer relevant", "obsolete",
-        "already resolved", "already closed", "already handled"
+        "already resolved", "already closed", "already handled",
+        "resolved on site", "resolved verbally", "handled on site",
+        "handled verbally", "closed on site", "sorted on site",
+        "done on site", "agreed on site", "settled on site",
+        "settled verbally", "resolved offline", "handled offline",
+        "resolved directly", "no follow-up needed", "no followup needed",
+        "no further action", "stop chasing", "stop following up",
+        "verbally agreed", "verbally resolved", "verbally confirmed on site"
     ]
     text = body_text.lower()
     return any(kw in text for kw in rejection_keywords)
@@ -625,12 +632,6 @@ def find_all_open_actions_matching_refs(in_reply_to, references):
 
 
 def find_open_actions_by_subject(subject):
-    """
-    Fallback matcher for replies that lost proper email threading headers
-    (common with mobile clients, or a reply composed fresh instead of using
-    Reply). Matches the meeting reference embedded in Alex's original
-    subject lines against the incoming subject text.
-    """
     if not subject:
         return []
     clean_subject = subject.lower()
