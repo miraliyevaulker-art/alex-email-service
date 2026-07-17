@@ -438,12 +438,6 @@ def is_approval_reply(body_text):
 
 
 def is_rejection_reply(body_text):
-    """
-    Detect if internal team is telling Alex to STOP / CLOSE / NOT PROCEED
-    with a MOM action or draft. Checked BEFORE approval keywords since
-    phrases like 'no need' do not overlap with approval terms, but we
-    still want rejection to take priority in ambiguous cases.
-    """
     rejection_keywords = [
         "no need", "not needed", "not required", "no longer required",
         "close this", "close it", "please close", "disregard",
@@ -533,6 +527,37 @@ def classify_thread_participants(all_participants_with_names):
     return internal, clients, contractors
 
 
+def merge_party_classification(all_thread_with_names, claude_classification):
+    email_to_entry = {
+        c.get("email", "").lower(): c
+        for c in claude_classification if c.get("email")
+    }
+
+    internal, dom_clients, dom_others = classify_thread_participants(all_thread_with_names)
+    dom_client_emails = {p["email"].lower() for p in dom_clients}
+
+    clients = []
+    others  = []
+    for p in all_thread_with_names:
+        addr = p["email"]
+        if addr == ZOHO_EMAIL.lower() or is_internal_email(addr):
+            continue
+        entry = email_to_entry.get(addr.lower())
+        if entry:
+            role_label = entry.get("role_label", "Other") or "Other"
+            if entry.get("is_client"):
+                clients.append({**p, "role_label": "Client"})
+            else:
+                others.append({**p, "role_label": role_label})
+        else:
+            if addr.lower() in dom_client_emails:
+                clients.append({**p, "role_label": "Client"})
+            else:
+                others.append({**p, "role_label": "Contractor"})
+
+    return internal, clients, others
+
+
 def find_action_by_thread(in_reply_to, references):
     try:
         sheet = get_action_tracker_sheet()
@@ -556,7 +581,6 @@ def find_action_by_thread(in_reply_to, references):
 
 
 def find_all_actions_by_thread(thread_id):
-    """Find ALL non-closed action rows sharing this thread_id (a MOM can have multiple actions)"""
     matches = []
     try:
         sheet = get_action_tracker_sheet()
@@ -576,54 +600,123 @@ def find_all_actions_by_thread(thread_id):
     return matches
 
 
+def find_all_open_actions_matching_refs(in_reply_to, references):
+    try:
+        sheet = get_action_tracker_sheet()
+        if not sheet:
+            return []
+        all_values = sheet.get_all_values()
+        results = []
+        for i, row in enumerate(all_values[1:], start=2):
+            if len(row) < 10:
+                continue
+            thread_id = row[9].strip() if len(row) > 9 else ""
+            status    = row[6].strip() if len(row) > 6 else ""
+            if not thread_id:
+                continue
+            if thread_id in in_reply_to or thread_id in references:
+                if status not in ["Closed", "Closed — No Response", "Closed — No Action Required"]:
+                    data = get_action_data_from_row(row)
+                    results.append({"row": i, **data})
+        return results
+    except Exception as e:
+        logger.error(f"Find matching refs error: {e}")
+        return []
+
+
+def find_open_actions_by_subject(subject):
+    """
+    Fallback matcher for replies that lost proper email threading headers
+    (common with mobile clients, or a reply composed fresh instead of using
+    Reply). Matches the meeting reference embedded in Alex's original
+    subject lines against the incoming subject text.
+    """
+    if not subject:
+        return []
+    clean_subject = subject.lower()
+    for prefix in ["re:", "fwd:", "fw:"]:
+        clean_subject = clean_subject.replace(prefix, "")
+    clean_subject = clean_subject.strip()
+    if not clean_subject:
+        return []
+
+    try:
+        sheet = get_action_tracker_sheet()
+        if not sheet:
+            return []
+        all_values = sheet.get_all_values()
+        matches = []
+        for i, row in enumerate(all_values[1:], start=2):
+            if len(row) < 10:
+                continue
+            meeting_ref = row[1].strip() if len(row) > 1 else ""
+            status      = row[6].strip() if len(row) > 6 else ""
+            thread_id   = row[9].strip() if len(row) > 9 else ""
+            if not meeting_ref or not thread_id:
+                continue
+            if status in ["Closed", "Closed — No Response", "Closed — No Action Required"]:
+                continue
+            if meeting_ref.lower() in clean_subject or clean_subject in meeting_ref.lower():
+                data = get_action_data_from_row(row)
+                matches.append({"row": i, **data})
+        return matches
+    except Exception as e:
+        logger.error(f"Subject fallback match error: {e}")
+        return []
+
+
 def extract_mom_actions(mom_content, thread_participants_with_names, subject):
     try:
-        internal, clients, contractors = classify_thread_participants(
-            thread_participants_with_names)
+        external_participants = [
+            p for p in thread_participants_with_names
+            if p["email"] != ZOHO_EMAIL.lower() and not is_internal_email(p["email"])
+        ]
 
         def fmt_list(lst):
             return "\n".join([
-                f"  - {p['name']} <{p['email']}>" if p['name']
-                else f"  - {p['email']}"
+                f"  - {p['name']} <{p['email']}>" if p['name'] else f"  - {p['email']}"
                 for p in lst
             ]) or "  None detected"
 
-        context = f"""SCOPE team (internal PMC):
-{fmt_list(internal)}
-
-Known clients (CC for awareness only, never action owners):
-{fmt_list(clients)}
-
-External contractors/consultants (potential action owners):
-{fmt_list(contractors)}"""
+        context = f"""External parties present in this email thread (To/CC), not yet classified:
+{fmt_list(external_participants)}"""
 
         prompt = f"""Analyse this Minutes of Meeting and extract all action items.
 
 Meeting subject: {subject}
 
-Participants in this email thread:
 {context}
 
 MOM Content:
-{mom_content[:8000]}
+{mom_content[:16000]}
+
+IMPORTANT — PARTY IDENTIFICATION:
+The MOM document itself may explicitly label parties present at or referenced in the meeting, for example lines such as "Client: Pasha Bank", "Employer: ...", "Owner: ...", "Contractor: ...", "Consultant: ...", "Designer: ...", "Architect: ...", "Building Operator: ...", "Facility Manager: ...", "Subcontractor: ...", "Supplier: ...", "PMC: ...". Search the document text carefully for every such label — they take priority over any other signal, and there may be more than two parties in a single meeting.
+Match each labelled company name to the external email addresses listed above by comparing the company name to the email domain, for example Pasha Bank matches an email ending in pashabank.az.
+For every external email listed above, identify its role_label using the exact role wording used in the MOM document (for example "Client", "Contractor", "Designer", "Consultant", "Building Operator", "Subcontractor", "Supplier"). If a party is genuinely not labelled anywhere in the document, infer the most likely role from context and use a short descriptive label, but always prefer an explicit label from the document when present.
+Separately mark is_client true only for the party functioning as the Client, Employer, or Owner — this determines that they are CC'd for awareness only and never assigned an action. All other roles (Contractor, Designer, Consultant, Building Operator, Subcontractor, Supplier, etc.) are potential action owners.
 
 For each action item:
 1. Action description
 2. Responsible party name as mentioned in MOM
-3. Responsible email — match to contractor list. If matched use email. If no match write UNKNOWN.
+3. Responsible email — match to external parties above by company name to domain. If matched use that email. If no confident match write UNKNOWN.
 4. Responsible display name — full name if known, else empty string
 5. Due date or NOT SPECIFIED
 6. Meeting reference
-7. Party role — CONTRACTOR, CLIENT, or SCOPE
+7. Responsible role label — the exact role wording from the document (e.g. Contractor, Designer, Building Operator, Consultant), or SCOPE if the action belongs to the internal PMC team
 
-Also identify client company and contractor company from MOM content.
-
-Respond in this exact JSON only:
-{{"meeting_reference": "...", "client_identified": "...", "contractor_identified": "...", "actions": [{{"action": "...", "responsible_party": "...", "responsible_email": "...", "responsible_name": "...", "due_date": "...", "party_role": "CONTRACTOR"}}]}}"""
+Respond in this exact JSON only, no other text:
+{{
+  "meeting_reference": "...",
+  "client_identified": "company name exactly as labelled in the MOM, or Unknown",
+  "contractor_identified": "company name exactly as labelled in the MOM, or Unknown",
+  "party_classification": [{{"email": "...", "role_label": "...", "is_client": true or false, "company": "..."}}],
+  "actions": [{{"action": "...", "responsible_party": "...", "responsible_email": "...", "responsible_name": "...", "due_date": "...", "responsible_role_label": "..."}}]
+}}"""
 
         response = anthropic_client.messages.create(
             model=MODEL,
-            max_tokens=2000,
+            max_tokens=2500,
             messages=[{"role": "user", "content": prompt}]
         )
         text = response.content[0].text.strip()
@@ -632,13 +725,15 @@ Respond in this exact JSON only:
             if text.startswith("json"):
                 text = text[4:]
         data = json.loads(text.strip())
-        logger.info(f"Extracted {len(data.get('actions', []))} actions")
+        logger.info(f"Extracted {len(data.get('actions', []))} actions, "
+                    f"client={data.get('client_identified')}, contractor={data.get('contractor_identified')}")
         return data
     except Exception as e:
         logger.error(f"MOM extraction error: {e}")
         return {"meeting_reference": subject, "actions": [],
                 "client_identified": "Unknown",
-                "contractor_identified": "Unknown"}
+                "contractor_identified": "Unknown",
+                "party_classification": []}
 
 
 def analyse_external_reply(action_item, reply_content):
@@ -668,6 +763,163 @@ Respond in this exact JSON only:
         logger.error(f"Reply analysis error: {e}")
         return {"satisfied": False, "analysis": "Unable to analyse.",
                 "outstanding_items": "Unknown"}
+
+
+def extract_mom_clarification(reply_body, actions_summary):
+    try:
+        prompt = f"""An internal team member replied to a MOM action item confirmation with clarifications.
+
+Current action items:
+{actions_summary}
+
+Reply received:
+{reply_body[:3000]}
+
+Extract any party clarifications — names or companies paired with an email address, or statements identifying who the client, contractor, designer, or other stakeholder is. For each one found provide party_name, email, and role (CLIENT, or the specific role label used such as CONTRACTOR, DESIGNER, CONSULTANT, BUILDING OPERATOR, SUBCONTRACTOR, SUPPLIER, SCOPE). If nothing usable is found return an empty list.
+
+Respond in this exact JSON only:
+{{"clarifications": [{{"party_name": "...", "email": "...", "role": "..."}}], "acknowledgement_note": "one sentence summary or NONE"}}"""
+
+        response = anthropic_client.messages.create(
+            model=MODEL, max_tokens=500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text = response.content[0].text.strip()
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        return json.loads(text.strip())
+    except Exception as e:
+        logger.error(f"Clarification parse error: {e}")
+        return {"clarifications": [], "acknowledgement_note": "NONE"}
+
+
+def append_to_action_list_column(row_number, col, value):
+    try:
+        sheet = get_action_tracker_sheet()
+        if not sheet:
+            return
+        current = sheet.cell(row_number, col).value or ""
+        items = [x.strip() for x in current.split(",") if x.strip()]
+        if value.lower() not in [x.lower() for x in items]:
+            items.append(value)
+        sheet.update_cell(row_number, col, ",".join(items))
+    except Exception as e:
+        logger.error(f"Append list column error: {e}")
+
+
+def update_action_contact(row_number, responsible_email=None, responsible_name=None, status=None):
+    try:
+        sheet = get_action_tracker_sheet()
+        if sheet:
+            if responsible_email:
+                sheet.update_cell(row_number, 5, responsible_email)
+            if responsible_name:
+                sheet.update_cell(row_number, 17, responsible_name)
+            if status:
+                sheet.update_cell(row_number, 7, status)
+    except Exception as e:
+        logger.error(f"Update action contact error: {e}")
+
+
+def apply_mom_clarifications(thread_actions, clarifications):
+    updated = []
+    for c in clarifications:
+        name   = (c.get("party_name") or "").strip()
+        email_ = (c.get("email") or "").strip()
+        role   = (c.get("role") or "").strip().upper()
+        if not email_ or "@" not in email_:
+            continue
+
+        if role == "CLIENT":
+            for a in thread_actions:
+                append_to_action_list_column(a["row"], 16, email_)
+                append_to_action_list_column(a["row"], 15, email_)
+            updated.append(f"Client contact recorded: {name} <{email_}>" if name else f"Client contact recorded: {email_}")
+            continue
+
+        matched_any = False
+        for a in thread_actions:
+            party = (a.get("responsible") or "").lower()
+            if a["status"] == "Email Unknown" and name and (name.lower() in party or party in name.lower()):
+                update_action_contact(a["row"], responsible_email=email_, responsible_name=name, status="Open")
+                append_to_action_list_column(a["row"], 15, email_)
+                updated.append(f"Updated '{a['action'][:60]}' — responsible: {name} <{email_}>")
+                matched_any = True
+
+        if not matched_any:
+            unknown_rows = [a for a in thread_actions if a["status"] == "Email Unknown"]
+            if len(unknown_rows) == 1:
+                a = unknown_rows[0]
+                update_action_contact(a["row"], responsible_email=email_, responsible_name=name, status="Open")
+                append_to_action_list_column(a["row"], 15, email_)
+                updated.append(f"Updated '{a['action'][:60]}' — responsible: {name} <{email_}>")
+    return updated
+
+
+def handle_mom_thread_reply(sender, body, thread_actions, msg_id_hdr, in_reply_to, references):
+    if not thread_actions:
+        return False
+
+    meeting_ref = thread_actions[0]["meeting_ref"]
+    new_refs    = f"{references} {msg_id_hdr}".strip() if references else msg_id_hdr
+    cc          = [r for r in REPORT_RECIPIENTS if r.lower() != sender.lower()]
+
+    if is_rejection_reply(body):
+        for a in thread_actions:
+            update_action_row(a["row"], status="Closed — No Action Required",
+                              notes=f"Closed per instruction from {sender}")
+        notice  = f"Dear Team,\n\nPer instruction from {sender}, the following action item(s) from {meeting_ref} have been closed with no further action.\n\n"
+        for a in thread_actions:
+            notice += f"- {a['action']}\n"
+        notice += f"\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+        send_email(REPORT_RECIPIENTS, f"Closed — No Action Required — {meeting_ref}",
+                   notice, html_body=build_reply_html(notice))
+        logger.info(f"Closed {len(thread_actions)} action(s) per rejection reply")
+        return True
+
+    actions_summary = "\n".join([
+        f"- {a['action']} | Responsible: {a['responsible']} | Email: {a['email']} | Status: {a['status']}"
+        for a in thread_actions
+    ])
+    clar           = extract_mom_clarification(body, actions_summary)
+    clarifications = clar.get("clarifications", [])
+
+    if clarifications:
+        updated = apply_mom_clarifications(thread_actions, clarifications)
+        notice  = f"Dear {get_first_name(sender)},\n\nThank you for the clarification.\n\n"
+        if updated:
+            notice += "I have updated the Action Tracker as follows:\n\n"
+            for s in updated:
+                notice += f"- {s}\n"
+        else:
+            notice += "I have noted the information provided.\n\n"
+        notice += f"\nThe chase protocol will now proceed automatically for these items.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+        send_email([sender], f"Action Tracker Updated — {meeting_ref}", notice,
+                   html_body=build_reply_html(notice), cc_emails=cc,
+                   reply_to_msg_id=msg_id_hdr, references=new_refs)
+        logger.info(f"Applied {len(updated)} clarification(s) to thread")
+        return True
+
+    if is_approval_reply(body):
+        for a in thread_actions:
+            update_action_row(a["row"], notes="Party identification confirmed by internal team")
+        notice = f"Dear {get_first_name(sender)},\n\nThank you for confirming. The chase protocol will proceed automatically per the agreed schedule.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+        send_email([sender], f"Confirmed — {meeting_ref}", notice,
+                   html_body=build_reply_html(notice), cc_emails=cc,
+                   reply_to_msg_id=msg_id_hdr, references=new_refs)
+        return True
+
+    notice  = f"Dear {get_first_name(sender)},\n\nThank you for your reply regarding {meeting_ref}. "
+    notice += "I was unable to identify a specific email address or clear instruction in this message. "
+    notice += "If you are providing a contact, please state the name or company together with the email address, for example: ABC Contractor — contact@abc.az. "
+    notice += "If no further action is required please reply no need.\n\n"
+    notice += f"Kind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+    send_email([sender], f"Re: {meeting_ref}", notice,
+               html_body=build_reply_html(notice), cc_emails=cc,
+               reply_to_msg_id=msg_id_hdr, references=new_refs)
+    return True
 
 
 def draft_external_reminder(action_item, responsible_name, responsible_party,
@@ -844,8 +1096,11 @@ def process_mom_email(sender, subject, body, attachments,
     client_id     = extracted.get("client_identified", "Unknown")
     contractor_id = extracted.get("contractor_identified", "Unknown")
 
-    internal, clients, contractors = classify_thread_participants(all_thread_with_names)
-    client_emails   = [p["email"] for p in clients]
+    party_classification = extracted.get("party_classification", [])
+    internal, clients, others = merge_party_classification(all_thread_with_names, party_classification)
+    contractors = others
+
+    client_emails    = [p["email"] for p in clients]
     all_participants = [p["email"] for p in all_thread_with_names
                         if p["email"] != ZOHO_EMAIL.lower()]
 
@@ -857,12 +1112,12 @@ def process_mom_email(sender, subject, body, attachments,
         return
 
     unknown_count = 0
-    action_rows = []
+    action_rows   = []
     for action in actions:
-        resp_email = action.get("responsible_email", "UNKNOWN")
-        resp_name  = action.get("responsible_name", "")
-        party_role = action.get("party_role", "CONTRACTOR")
-        status     = "Open" if resp_email != "UNKNOWN" else "Email Unknown"
+        resp_email  = action.get("responsible_email", "UNKNOWN")
+        resp_name   = action.get("responsible_name", "")
+        role_label  = action.get("responsible_role_label", "Contractor")
+        status      = "Open" if resp_email != "UNKNOWN" else "Email Unknown"
         if resp_email == "UNKNOWN":
             unknown_count += 1
         save_action_item(
@@ -876,14 +1131,58 @@ def process_mom_email(sender, subject, body, attachments,
         )
         action_rows.append({**action, "status": status})
 
-    # Branded, card-style confirmation email — threaded back to the MOM
+    def fmt_p(lst):
+        if not lst:
+            return "None detected"
+        return "\n".join([
+            (f"  {p.get('role_label','')+' — ' if p.get('role_label') else ''}{p['name']} <{p['email']}>"
+             if p['name'] else
+             f"  {p.get('role_label','')+' — ' if p.get('role_label') else ''}{p['email']}")
+            for p in lst
+        ])
+
+    roles_present = {}
+    for p in contractors:
+        roles_present.setdefault(p.get("role_label", "Contractor"), []).append(p)
+
+    party_analysis  = f"My analysis of the parties in this meeting:\n\n"
+    party_analysis += f"Client identified from MOM: {client_id}\n"
+    if clients:
+        party_analysis += f"Client contacts:\n{fmt_p(clients)}\n"
+        party_analysis += f"These parties will be CC'd on all follow-up emails for awareness and will never receive direct action requests.\n\n"
+    else:
+        party_analysis += f"No client email addresses detected. If the client should be copied please provide their email.\n\n"
+
+    if roles_present:
+        for role, people in roles_present.items():
+            party_analysis += f"{role} contacts:\n{fmt_p(people)}\n"
+            party_analysis += f"These parties will receive action follow-up emails after your approval.\n\n"
+    else:
+        party_analysis += f"No contractor, designer, or other stakeholder email addresses detected. Please provide contact details.\n\n"
+
+    party_analysis += f"SCOPE team:\n{fmt_p(internal)}\n"
+    party_analysis += f"These parties will be CC'd on all outgoing emails.\n\n"
+
+    if unknown_count:
+        party_analysis += f"Note: {unknown_count} action(s) could not be matched to an email address. Please provide the correct contact details.\n\n"
+
+    action_summary = ""
+    for i, action in enumerate(actions, 1):
+        role_tag = f"[{action.get('responsible_role_label', 'Contractor')}]"
+        name     = action.get("responsible_name", "")
+        party    = action.get("responsible_party", "Unknown")
+        label    = f"{name} ({party})" if name else party
+        action_summary += f"{i}. {role_tag} Action: {action.get('action', '')}\n"
+        action_summary += f"   Responsible: {label}\n"
+        action_summary += f"   Email: {action.get('responsible_email', 'UNKNOWN')}\n"
+        action_summary += f"   Due: {action.get('due_date', 'Not specified')}\n\n"
+
     html_confirmation = build_mom_confirmation_html(
         sender, meeting_ref, action_rows,
         client_id, contractor_id, internal, clients, contractors,
         unknown_count
     )
 
-    # Plain text fallback (kept simple; the HTML carries the design)
     plain = f"MOM Action Items — Confirmation Required — {meeting_ref}\n\n"
     plain += f"Client identified: {client_id}\nContractor identified: {contractor_id}\n\n"
     for i, action in enumerate(actions, 1):
@@ -892,8 +1191,6 @@ def process_mom_email(sender, subject, body, attachments,
 
     cc_approval = [r for r in REPORT_RECIPIENTS if r.lower() != sender.lower()]
 
-    # Thread this back to the original MOM message so replies (approve / no need)
-    # are correctly matched to these action rows.
     send_email(
         [sender],
         f"MOM Action Items — Confirmation Required — {meeting_ref}",
@@ -909,10 +1206,6 @@ def process_mom_email(sender, subject, body, attachments,
 def build_mom_confirmation_html(sender, meeting_ref, actions, client_id,
                                 contractor_id, internal, clients, contractors,
                                 unknown_count):
-    """
-    Branded, card-style confirmation email for newly extracted MOM actions.
-    Matches the visual language of the daily report and external follow-ups.
-    """
     today    = datetime.now().strftime("%d %B %Y")
     time_now = datetime.now().strftime("%H:%M")
 
@@ -942,12 +1235,28 @@ def build_mom_confirmation_html(sender, meeting_ref, actions, client_id,
         "No client email detected in this thread. Please provide if applicable.",
         "#3CB496"
     )
-    party_html += fmt_party_card(
-        f"Contractor — {contractor_id}", contractors,
-        "Will receive action follow-up emails once you approve.",
-        "No contractor email detected. Please provide contact details.",
-        "#f0a030"
-    )
+
+    roles_present = {}
+    for p in contractors:
+        roles_present.setdefault(p.get("role_label", "Contractor"), []).append(p)
+
+    if roles_present:
+        for role, people in roles_present.items():
+            party_html += fmt_party_card(
+                f"{role} — {contractor_id if role.lower() == 'contractor' else ''}".strip(" —"),
+                people,
+                "Will receive action follow-up emails once you approve.",
+                f"No {role.lower()} email detected. Please provide contact details.",
+                "#f0a030"
+            )
+    else:
+        party_html += fmt_party_card(
+            f"Contractor — {contractor_id}", [],
+            "Will receive action follow-up emails once you approve.",
+            "No contractor email detected. Please provide contact details.",
+            "#f0a030"
+        )
+
     party_html += fmt_party_card(
         "SCOPE team", internal,
         "CC'd on all outgoing correspondence.",
@@ -957,7 +1266,7 @@ def build_mom_confirmation_html(sender, meeting_ref, actions, client_id,
 
     actions_html = ""
     for i, a in enumerate(actions, 1):
-        role   = a.get("party_role", "CONTRACTOR")
+        role   = a.get("responsible_role_label", "Contractor")
         name   = a.get("responsible_name", "")
         party  = a.get("responsible_party", "Unknown")
         label  = f"{name} ({party})" if name else party
@@ -965,8 +1274,8 @@ def build_mom_confirmation_html(sender, meeting_ref, actions, client_id,
         due    = a.get("due_date", "Not specified")
         status = a.get("status", "Open")
 
-        role_bg = {"CLIENT": "#e1f5ee", "SCOPE": "#eef1f6"}.get(role, "#fff8ee")
-        role_tx = {"CLIENT": "#0f6e56", "SCOPE": "#1a2942"}.get(role, "#9a6000")
+        role_bg   = {"Client": "#e1f5ee", "SCOPE": "#eef1f6"}.get(role, "#fff8ee")
+        role_tx   = {"Client": "#0f6e56", "SCOPE": "#1a2942"}.get(role, "#9a6000")
         status_bg = "#fff0f0" if status == "Email Unknown" else "#fff8ee"
         status_tx = "#c00000" if status == "Email Unknown" else "#9a6000"
 
@@ -994,7 +1303,7 @@ def build_mom_confirmation_html(sender, meeting_ref, actions, client_id,
         unknown_banner = f"""
         <div style="background:#fff0f0;border:1px solid #f0c0c0;border-radius:6px;padding:10px 14px;margin-bottom:16px;">
           <div style="font-size:11px;font-weight:600;color:#c00000;margin-bottom:4px;">EMAIL UNKNOWN — ACTION REQUIRED</div>
-          <div style="font-size:12px;color:#800000;">{unknown_count} action(s) could not be matched to a contractor email. Please provide the correct contact details.</div>
+          <div style="font-size:12px;color:#800000;">{unknown_count} action(s) could not be matched to a contact email. Please provide the correct contact details.</div>
         </div>"""
 
     return f"""<!DOCTYPE html>
@@ -1043,6 +1352,8 @@ def build_mom_confirmation_html(sender, meeting_ref, actions, client_id,
       <div style="font-size:12px;color:#1a4d80;line-height:1.6;">
         Please reply <strong>approve</strong> or <strong>confirmed</strong> if the party identification above is correct — draft follow-up reminders will then be prepared per the chase protocol before any email is sent externally.
         If no action is required, please reply <strong>no need</strong> or <strong>close this</strong> and I will close this item immediately with no further reminders.
+        If any party is incorrect, simply state the correct name/company and email in your reply and I will update the tracker.
+        For best results please reply directly to this email rather than starting a new message, so I can match your response automatically.
       </div>
     </div>
 
@@ -1060,14 +1371,7 @@ def build_mom_confirmation_html(sender, meeting_ref, actions, client_id,
 
 
 def check_mom_confirmation_and_rejections():
-    """
-    Scans inbox for internal replies to MOM confirmation / draft approval threads.
-    If rejection detected ('no need', 'close this', etc.) — close ALL matching
-    action rows for that thread immediately and stop all chasing.
-    If approval detected — no action needed here (normal flow already proceeds
-    via check_action_approvals for Draft Pending rows).
-    """
-    logger.info("Checking MOM confirmation replies for rejection/approval...")
+    logger.info("Checking MOM confirmation replies for rejection (safety net)...")
     mail = None
     try:
         sheet = get_action_tracker_sheet()
@@ -1078,7 +1382,6 @@ def check_mom_confirmation_and_rejections():
         if not all_values or len(all_values) < 2:
             return
 
-        # Collect distinct thread_ids for any non-closed action
         open_thread_ids = set()
         for row in all_values[1:]:
             if len(row) < 10:
@@ -1282,7 +1585,6 @@ def check_action_approvals():
                 if not is_internal_email(from_addr):
                     continue
 
-                # Rejection takes priority — close instead of send
                 if is_rejection_reply(body):
                     for thread_id, action_data in pending_approvals.items():
                         if thread_id and (thread_id in in_reply_to or
@@ -2265,7 +2567,16 @@ def process_emails():
                                                msg_id_hdr, "Monitoring")
 
                 elif is_direct and is_internal:
-                    if is_mom_email(subject, body, attachments):
+                    thread_actions = find_all_open_actions_matching_refs(in_reply_to, references)
+                    if not thread_actions:
+                        thread_actions = find_open_actions_by_subject(subject)
+                        if thread_actions:
+                            logger.info(f"Matched via subject fallback (no threading headers found)")
+
+                    if thread_actions:
+                        logger.info(f"Reply matches existing MOM/action thread — routing as clarification/approval/rejection")
+                        handle_mom_thread_reply(sender, body, thread_actions, msg_id_hdr, in_reply_to, references)
+                    elif is_mom_email(subject, body, attachments):
                         logger.info(f"MOM direct from internal — extracting actions")
                         all_with_names = []
                         seen = set()
