@@ -126,6 +126,36 @@ def safe_logout(mail):
         pass
 
 
+def strip_quoted_reply(body):
+    """
+    Return only the newly typed portion of a reply, removing quoted
+    original message content so keyword detection (approve/reject) isn't
+    confused by boilerplate text inside Alex's own quoted draft.
+    """
+    if not body:
+        return body
+    lines = body.split("\n")
+    cut_index = len(lines)
+    for i, line in enumerate(lines):
+        stripped = line.strip().lower()
+        if not stripped:
+            continue
+        if stripped.startswith(">"):
+            cut_index = i
+            break
+        if stripped.startswith("on ") and "wrote:" in stripped:
+            cut_index = i
+            break
+        if stripped.startswith("-----original message-----"):
+            cut_index = i
+            break
+        if stripped in ["from:", "sent:", "subject:", "to:"]:
+            cut_index = i
+            break
+    result = "\n".join(lines[:cut_index]).strip()
+    return result if result else body
+
+
 def get_gspread_client():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -859,6 +889,58 @@ def apply_mom_clarifications(thread_actions, clarifications):
     return updated
 
 
+def dispatch_approved_external_draft(action_data):
+    """
+    Send an already-drafted external follow-up immediately once approval
+    is detected in real time (rather than waiting for the 6-hourly
+    check_action_approvals job).
+    """
+    reminder_count = action_data["reminder_count"] + 1
+    draft = draft_external_reminder(
+        action_data["action"],
+        action_data["responsible_name"],
+        action_data["responsible"],
+        action_data["due_date"],
+        action_data["meeting_ref"],
+        reminder_count,
+        on_behalf_of=get_first_name(action_data["mom_sender"])
+    )
+    if not draft or action_data["email"] in ["UNKNOWN", ""]:
+        return
+
+    if not action_data["responsible_name"]:
+        domain    = action_data["email"].split("@")[-1] if "@" in action_data["email"] else ""
+        all_to    = get_all_domain_emails(domain, action_data["all_participants"])
+        to_emails = all_to if all_to else [action_data["email"]]
+    else:
+        to_emails = [action_data["email"]]
+
+    cc_list      = build_cc_for_external(action_data)
+    resp_label   = action_data["responsible_name"] or action_data["responsible"]
+    reminder_tag = {1: "Follow-up", 2: "Second Follow-up",
+                    3: "Escalation Notice"}.get(reminder_count, "Follow-up")
+
+    html_reminder = build_external_reminder_html(
+        draft, action_data["meeting_ref"], action_data["action"],
+        resp_label, action_data["due_date"], reminder_tag,
+        on_behalf_of=get_first_name(action_data["mom_sender"])
+    )
+
+    sent = send_email(
+        to_emails,
+        f"Action Item Follow-up — {action_data['meeting_ref']}",
+        draft, html_body=html_reminder, cc_emails=cc_list
+    )
+    if sent:
+        update_action_row(
+            action_data["row"], status="Reminded",
+            last_reminded=datetime.now().strftime("%d.%m.%Y %H:%M"),
+            reminder_count=reminder_count,
+            draft_sent=datetime.now().strftime("%d.%m.%Y %H:%M")
+        )
+        logger.info(f"Dispatched to {to_emails} CC {cc_list}")
+
+
 def handle_mom_thread_reply(sender, body, thread_actions, msg_id_hdr, in_reply_to, references):
     if not thread_actions:
         return False
@@ -1415,7 +1497,7 @@ def check_mom_confirmation_and_rejections():
                 if not is_internal_email(from_addr):
                     continue
 
-                body = get_email_body(msg)
+                body = strip_quoted_reply(get_email_body(msg))
                 if not is_rejection_reply(body):
                     continue
 
@@ -1560,7 +1642,7 @@ def check_action_approvals():
                 continue
             data = get_action_data_from_row(row)
             if data["status"] == "Draft Pending" and data["thread_id"]:
-                pending_approvals[data["thread_id"]] = {"row": i, **data}
+                pending_approvals.setdefault(data["thread_id"], []).append({"row": i, **data})
 
         if not pending_approvals:
             return
@@ -1581,15 +1663,16 @@ def check_action_approvals():
                 from_addr   = extract_email_address(msg.get("From", ""))
                 in_reply_to = safe_decode(msg.get("In-Reply-To", "")).strip()
                 references  = safe_decode(msg.get("References",  "")).strip()
-                body        = get_email_body(msg)
+                body        = strip_quoted_reply(get_email_body(msg))
 
                 if not is_internal_email(from_addr):
                     continue
 
                 if is_rejection_reply(body):
-                    for thread_id, action_data in pending_approvals.items():
-                        if thread_id and (thread_id in in_reply_to or
-                                          thread_id in references):
+                    for thread_id, action_list in pending_approvals.items():
+                        if not (thread_id and (thread_id in in_reply_to or thread_id in references)):
+                            continue
+                        for action_data in action_list:
                             update_action_row(
                                 action_data["row"],
                                 status="Closed — No Action Required",
@@ -1608,9 +1691,10 @@ def check_action_approvals():
                 if not is_approval_reply(body):
                     continue
 
-                for thread_id, action_data in pending_approvals.items():
-                    if thread_id and (thread_id in in_reply_to or
-                                      thread_id in references):
+                for thread_id, action_list in pending_approvals.items():
+                    if not (thread_id and (thread_id in in_reply_to or thread_id in references)):
+                        continue
+                    for action_data in action_list:
                         reminder_count = action_data["reminder_count"] + 1
                         draft = draft_external_reminder(
                             action_data["action"],
@@ -2534,7 +2618,8 @@ def process_emails():
                     continue
 
                 new_count  += 1
-                body        = get_email_body(msg)
+                body_raw    = get_email_body(msg)
+                body        = strip_quoted_reply(body_raw)
                 attachments = extract_attachments(msg)
 
                 if attachments:
@@ -2575,8 +2660,14 @@ def process_emails():
                             logger.info(f"Matched via subject fallback (no threading headers found)")
 
                     if thread_actions:
-                        logger.info(f"Reply matches existing MOM/action thread — routing as clarification/approval/rejection")
-                        handle_mom_thread_reply(sender, body, thread_actions, msg_id_hdr, in_reply_to, references)
+                        draft_pending = [a for a in thread_actions if a["status"] == "Draft Pending"]
+                        if draft_pending and is_approval_reply(body) and not is_rejection_reply(body):
+                            logger.info(f"Approval reply matches {len(draft_pending)} Draft Pending action(s) — dispatching to external immediately")
+                            for action_data in draft_pending:
+                                dispatch_approved_external_draft(action_data)
+                        else:
+                            logger.info(f"Reply matches existing MOM/action thread — routing as clarification/approval/rejection")
+                            handle_mom_thread_reply(sender, body, thread_actions, msg_id_hdr, in_reply_to, references)
                     elif is_mom_email(subject, body, attachments):
                         logger.info(f"MOM direct from internal — extracting actions")
                         all_with_names = []
