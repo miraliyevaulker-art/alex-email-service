@@ -127,11 +127,6 @@ def safe_logout(mail):
 
 
 def strip_quoted_reply(body):
-    """
-    Return only the newly typed portion of a reply, removing quoted
-    original message content so keyword detection (approve/reject) isn't
-    confused by boilerplate text inside Alex's own quoted draft.
-    """
     if not body:
         return body
     lines = body.split("\n")
@@ -223,6 +218,39 @@ def get_action_tracker_sheet():
             return sheet
     except Exception as e:
         logger.error(f"Action tracker error: {e}")
+        return None
+
+
+def get_ncr_tracker_sheet():
+    """
+    Columns:
+    1  Date Logged      2  NCR Number        3  Description
+    4  Contractor        5  Contractor Email  6  Date Raised
+    7  Status            8  Last Reminded     9  Reminder Count
+    10 Thread ID         11 Raised By         12 CAR Received
+    13 CAR Content       14 Notes             15 All Thread Participants
+    16 Responsible Name
+    """
+    try:
+        client      = get_gspread_client()
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+        try:
+            return spreadsheet.worksheet("NCR Tracker")
+        except:
+            sheet = spreadsheet.add_worksheet(
+                title="NCR Tracker", rows=2000, cols=16)
+            sheet.append_row([
+                "Date Logged", "NCR Number", "Description",
+                "Contractor", "Contractor Email", "Date Raised",
+                "Status", "Last Reminded", "Reminder Count",
+                "Thread ID", "Raised By", "CAR Received",
+                "CAR Content", "Notes", "All Thread Participants",
+                "Responsible Name"
+            ])
+            logger.info("Created NCR Tracker tab")
+            return sheet
+    except Exception as e:
+        logger.error(f"NCR tracker error: {e}")
         return None
 
 
@@ -408,6 +436,66 @@ def update_action_row(row_number, status=None, last_reminded=None,
         logger.error(f"Update action row error: {e}")
 
 
+def save_ncr_item(ncr_number, description, contractor, contractor_email,
+                  contractor_name, date_raised, thread_id, raised_by,
+                  all_participants, status="Open"):
+    try:
+        sheet = get_ncr_tracker_sheet()
+        if sheet:
+            sheet.append_row([
+                datetime.now().strftime("%d.%m.%Y %H:%M"),
+                ncr_number, description, contractor, contractor_email,
+                date_raised, status, "", "0", thread_id, raised_by,
+                "", "", "", ",".join(all_participants), contractor_name
+            ])
+            logger.info(f"NCR saved: {ncr_number} → {contractor_name} <{contractor_email}>")
+    except Exception as e:
+        logger.error(f"Save NCR error: {e}")
+
+
+def update_ncr_row(row_number, status=None, last_reminded=None,
+                   reminder_count=None, car_received=None,
+                   car_content=None, notes=None):
+    try:
+        sheet = get_ncr_tracker_sheet()
+        if sheet:
+            if status:
+                sheet.update_cell(row_number, 7, status)
+            if last_reminded:
+                sheet.update_cell(row_number, 8, last_reminded)
+            if reminder_count is not None:
+                sheet.update_cell(row_number, 9, str(reminder_count))
+            if car_received:
+                sheet.update_cell(row_number, 12, car_received)
+            if car_content:
+                sheet.update_cell(row_number, 13, car_content[:500])
+            if notes:
+                sheet.update_cell(row_number, 14, notes)
+    except Exception as e:
+        logger.error(f"Update NCR row error: {e}")
+
+
+def get_ncr_data_from_row(row):
+    participants_raw = row[14].strip() if len(row) > 14 else ""
+    all_participants = [p.strip() for p in participants_raw.split(",")
+                        if p.strip() and "@" in p.strip()]
+    return {
+        "date":             row[0].strip()  if row[0]        else "",
+        "ncr_number":       row[1].strip()  if len(row) > 1  else "",
+        "description":      row[2].strip()  if len(row) > 2  else "",
+        "contractor":       row[3].strip()  if len(row) > 3  else "",
+        "email":            row[4].strip()  if len(row) > 4  else "",
+        "date_raised":      row[5].strip()  if len(row) > 5  else "",
+        "status":           row[6].strip()  if len(row) > 6  else "",
+        "last_reminded":    row[7].strip()  if len(row) > 7  else "",
+        "reminder_count":   int(row[8].strip()) if len(row) > 8 and row[8].strip().isdigit() else 0,
+        "thread_id":        row[9].strip()  if len(row) > 9  else "",
+        "raised_by":        row[10].strip() if len(row) > 10 else "",
+        "all_participants": all_participants,
+        "responsible_name": row[15].strip() if len(row) > 15 else ""
+    }
+
+
 def read_memory_for_report():
     try:
         sheet = get_sheet("Sheet1")
@@ -437,6 +525,20 @@ def read_actions_for_report():
     except Exception as e:
         logger.error(f"Read actions error: {e}")
         return [], [], []
+
+
+def read_ncrs_for_report():
+    try:
+        sheet = get_ncr_tracker_sheet()
+        if sheet:
+            records     = sheet.get_all_records()
+            open_ncrs   = [r for r in records if r.get("Status") in ["Open", "Reminded", "Email Unknown"]]
+            closed_ncrs = [r for r in records if r.get("Status") == "Closed"]
+            return open_ncrs, closed_ncrs
+        return [], []
+    except Exception as e:
+        logger.error(f"Read NCRs error: {e}")
+        return [], []
 
 
 def get_first_name(email_address):
@@ -500,6 +602,22 @@ def is_mom_email(subject, body, attachments):
     for att in attachments:
         if any(kw in att.get("name", "").lower()
                for kw in ["mom", "minutes", "meeting", "protocol"]):
+            return True
+    return False
+
+
+def is_ncr_email(subject, body, attachments):
+    ncr_keywords = [
+        "ncr", "non-conformance report", "non conformance report",
+        "non-conformance", "non conformance", "corrective action request",
+        "nonconformance"
+    ]
+    text = (subject + " " + body).lower()
+    if any(kw in text for kw in ncr_keywords):
+        return True
+    for att in attachments:
+        if any(kw in att.get("name", "").lower()
+               for kw in ["ncr", "nonconformance", "non-conformance"]):
             return True
     return False
 
@@ -767,6 +885,57 @@ Respond in this exact JSON only, no other text:
                 "party_classification": []}
 
 
+def extract_ncr_details(ncr_content, thread_participants_with_names, subject):
+    try:
+        external_participants = [
+            p for p in thread_participants_with_names
+            if p["email"] != ZOHO_EMAIL.lower() and not is_internal_email(p["email"])
+        ]
+
+        def fmt_list(lst):
+            return "\n".join([
+                f"  - {p['name']} <{p['email']}>" if p['name'] else f"  - {p['email']}"
+                for p in lst
+            ]) or "  None detected"
+
+        prompt = f"""Analyse this Non-Conformance Report (NCR).
+
+Subject: {subject}
+
+External parties in this email thread:
+{fmt_list(external_participants)}
+
+NCR Content:
+{ncr_content[:12000]}
+
+Extract:
+1. NCR number or reference exactly as written
+2. Description of the non-conformance
+3. Responsible contractor company name, as labelled or clearly implied in the document
+4. Responsible email — match the contractor company name to a domain in the participants list above. If no confident match write UNKNOWN.
+5. Responsible display name — full name of the contact if known, else empty string
+6. Date raised as written, or NOT SPECIFIED
+
+Respond in this exact JSON only:
+{{"ncr_number": "...", "description": "...", "contractor": "...", "contractor_email": "...", "contractor_name": "...", "date_raised": "..."}}"""
+
+        response = anthropic_client.messages.create(
+            model=MODEL, max_tokens=1000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text = response.content[0].text.strip()
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        return json.loads(text.strip())
+    except Exception as e:
+        logger.error(f"NCR extraction error: {e}")
+        return {"ncr_number": "Unknown", "description": subject,
+                "contractor": "Unknown", "contractor_email": "UNKNOWN",
+                "contractor_name": "", "date_raised": "Not specified"}
+
+
 def analyse_external_reply(action_item, reply_content):
     try:
         prompt = f"""Review this external party reply against a required action item.
@@ -890,11 +1059,6 @@ def apply_mom_clarifications(thread_actions, clarifications):
 
 
 def dispatch_approved_external_draft(action_data):
-    """
-    Send an already-drafted external follow-up immediately once approval
-    is detected in real time (rather than waiting for the 6-hourly
-    check_action_approvals job).
-    """
     reminder_count = action_data["reminder_count"] + 1
     draft = draft_external_reminder(
         action_data["action"],
@@ -1286,6 +1450,54 @@ def process_mom_email(sender, subject, body, attachments,
     logger.info(f"MOM notification sent to {sender}")
 
 
+def process_ncr_email(sender, subject, body, attachments,
+                      all_thread_with_names, msg_id_hdr):
+    logger.info(f"Processing NCR: {subject}")
+
+    ncr_content = body
+    if attachments:
+        for att in attachments:
+            ncr_content += f"\n\n{att['name']}:\n{att['content']}"
+
+    extracted = extract_ncr_details(ncr_content, all_thread_with_names, subject)
+    all_participants = [p["email"] for p in all_thread_with_names
+                        if p["email"] != ZOHO_EMAIL.lower()]
+
+    resp_email = extracted.get("contractor_email", "UNKNOWN")
+    status     = "Open" if resp_email != "UNKNOWN" else "Email Unknown"
+
+    save_ncr_item(
+        extracted.get("ncr_number", "Unknown"),
+        extracted.get("description", subject),
+        extracted.get("contractor", "Unknown"),
+        resp_email,
+        extracted.get("contractor_name", ""),
+        extracted.get("date_raised", "Not specified"),
+        msg_id_hdr, sender, all_participants, status
+    )
+
+    notification  = f"Dear {get_first_name(sender)},\n\n"
+    notification += f"I have logged the following Non-Conformance Report in the NCR Tracker.\n\n"
+    notification += f"NCR reference: {extracted.get('ncr_number', 'Unknown')}\n"
+    notification += f"Description: {extracted.get('description', '')}\n"
+    notification += f"Contractor identified: {extracted.get('contractor', 'Unknown')}\n"
+    notification += f"Contractor email: {resp_email}\n"
+    notification += f"Date raised: {extracted.get('date_raised', 'Not specified')}\n\n"
+    if resp_email == "UNKNOWN":
+        notification += f"I was unable to match the contractor to an email address. Please provide the correct contact.\n\n"
+    notification += f"This NCR will remain open and I will follow up automatically per the chase protocol until a corrective action report is received and accepted. Please reply confirmed if the details above are correct, or provide corrections.\n\n"
+    notification += f"Kind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+
+    cc = [r for r in REPORT_RECIPIENTS if r.lower() != sender.lower()]
+    ncr_html = build_ncr_confirmation_html(sender, extracted)
+    send_email(
+        [sender], f"NCR Logged — {extracted.get('ncr_number', 'Unknown')}",
+        notification, html_body=ncr_html,
+        cc_emails=cc, reply_to_msg_id=msg_id_hdr, references=msg_id_hdr
+    )
+    logger.info(f"NCR notification sent to {sender}")
+
+
 def build_mom_confirmation_html(sender, meeting_ref, actions, client_id,
                                 contractor_id, internal, clients, contractors,
                                 unknown_count):
@@ -1437,6 +1649,110 @@ def build_mom_confirmation_html(sender, meeting_ref, actions, client_id,
         If no action is required, please reply <strong>no need</strong> or <strong>close this</strong> and I will close this item immediately with no further reminders.
         If any party is incorrect, simply state the correct name/company and email in your reply and I will update the tracker.
         For best results please reply directly to this email rather than starting a new message, so I can match your response automatically.
+      </div>
+    </div>
+
+    <div style="border-top:1px solid #f0f0f0;margin-top:20px;padding-top:16px;">
+      <div style="font-size:13px;font-weight:600;color:#1a2942;">Alex Rivera</div>
+      <div style="font-size:12px;color:#666;">Construction Expert</div>
+      <div style="font-size:12px;color:#666;">SCOPE Consulting MMC</div>
+      <div style="font-size:12px;color:#3CB496;">internal@scope-iq.io</div>
+    </div>
+
+  </div>
+</div>
+</body>
+</html>"""
+
+
+def build_ncr_confirmation_html(sender, ncr_data):
+    today    = datetime.now().strftime("%d %B %Y")
+    time_now = datetime.now().strftime("%H:%M")
+
+    ncr_number   = ncr_data.get("ncr_number", "Unknown")
+    description  = ncr_data.get("description", "")
+    contractor   = ncr_data.get("contractor", "Unknown")
+    contractor_name = ncr_data.get("contractor_name", "")
+    email_       = ncr_data.get("contractor_email", "UNKNOWN")
+    date_raised  = ncr_data.get("date_raised", "Not specified")
+
+    email_unknown = email_ == "UNKNOWN"
+    status_bg = "#fff0f0" if email_unknown else "#fff8ee"
+    status_tx = "#c00000" if email_unknown else "#9a6000"
+    status_label = "Email Unknown" if email_unknown else "Open"
+
+    contact_line = f"{contractor_name} &lt;{email_}&gt;" if contractor_name and not email_unknown else \
+                   (email_ if not email_unknown else "No contact email matched")
+
+    unknown_banner = ""
+    if email_unknown:
+        unknown_banner = """
+        <div style="background:#fff0f0;border:1px solid #f0c0c0;border-radius:6px;padding:10px 14px;margin-bottom:16px;">
+          <div style="font-size:11px;font-weight:600;color:#c00000;margin-bottom:4px;">EMAIL UNKNOWN — ACTION REQUIRED</div>
+          <div style="font-size:12px;color:#800000;">Could not match the contractor to a contact email. Please provide the correct contact details.</div>
+        </div>"""
+
+    return f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif;">
+<div style="max-width:620px;margin:0 auto;padding:20px 0;">
+
+  <div style="background:#1a2942;border-radius:12px 12px 0 0;padding:24px 28px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <div style="color:#fff;font-size:22px;font-weight:600;letter-spacing:1px;">SCOPE <span style="color:#3CB496;">IQ</span></div>
+      <div style="background:#c00000;color:#fff;font-size:11px;padding:4px 12px;border-radius:20px;font-weight:500;">NCR Logged</div>
+    </div>
+    <table style="width:100%;font-size:12px;border-collapse:collapse;">
+      <tr>
+        <td style="color:#8facc8;padding:2px 0;width:50%;">Date &nbsp;<strong style="color:#c8ddf0;">{today}</strong></td>
+        <td style="color:#8facc8;padding:2px 0;">Time &nbsp;<strong style="color:#c8ddf0;">{time_now} Baku</strong></td>
+      </tr>
+      <tr>
+        <td style="color:#8facc8;padding:2px 0;">Prepared by &nbsp;<strong style="color:#c8ddf0;">Alex Rivera</strong></td>
+        <td style="color:#8facc8;padding:2px 0;">NCR ref &nbsp;<strong style="color:#c8ddf0;">{ncr_number}</strong></td>
+      </tr>
+    </table>
+  </div>
+
+  <div style="background:#3a1a1a;padding:16px 28px;">
+    <div style="font-size:11px;color:#e0a8a8;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">Non-conformance description</div>
+    <div style="font-size:14px;color:#fff;font-weight:600;line-height:1.5;">{description}</div>
+  </div>
+
+  <div style="background:#fff;border:1px solid #e8e8e8;border-top:none;border-radius:0 0 12px 12px;padding:24px 28px;">
+
+    <p style="font-size:14px;color:#444;line-height:1.7;margin:0 0 16px;">
+      Dear {get_first_name(sender)}, I have logged the following Non-Conformance Report in the NCR Tracker.
+    </p>
+
+    <div style="border:1px solid #e8e8e8;border-radius:8px;margin-bottom:16px;overflow:hidden;">
+      <div style="background:#f8f9fa;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #e8e8e8;">
+        <span style="font-size:12px;color:#888;font-weight:500;">NCR DETAILS</span>
+        <span style="background:{status_bg};color:{status_tx};font-size:10px;padding:2px 8px;border-radius:20px;">{status_label}</span>
+      </div>
+      <div style="padding:14px 16px;">
+        <table style="width:100%;font-size:13px;border-collapse:collapse;">
+          <tr><td style="color:#888;padding:4px 0;width:140px;">NCR reference</td><td style="color:#1a2942;font-weight:600;">{ncr_number}</td></tr>
+          <tr><td style="color:#888;padding:4px 0;">Contractor</td><td style="color:#333;">{contractor}</td></tr>
+          <tr><td style="color:#888;padding:4px 0;">Contact</td><td style="color:#333;">{contact_line}</td></tr>
+          <tr><td style="color:#888;padding:4px 0;">Date raised</td><td style="color:#333;">{date_raised}</td></tr>
+        </table>
+      </div>
+    </div>
+
+    {unknown_banner}
+
+    <div style="background:#fff8ee;border:1px solid #f0c060;border-radius:6px;padding:12px 14px;margin-top:8px;">
+      <div style="font-size:12px;color:#5a3a00;line-height:1.6;">
+        This NCR will remain <strong>open</strong> and I will follow up automatically per the chase protocol.
+        It will not be closed until a corrective action report addressing the non-conformance is received and accepted.
+      </div>
+    </div>
+
+    <div style="background:#f0f7ff;border:1px solid #cfe3fb;border-radius:6px;padding:12px 14px;margin-top:12px;">
+      <div style="font-size:12px;color:#1a4d80;line-height:1.6;">
+        Please reply <strong>confirmed</strong> if the details above are correct, or provide corrections such as the correct contractor contact.
       </div>
     </div>
 
@@ -1879,6 +2195,129 @@ def check_external_action_reminders():
                 continue
     except Exception as e:
         logger.error(f"External reminder check error: {e}")
+
+
+def check_ncr_reminders():
+    """
+    NCR chase protocol — same Day 3/7/14 draft-and-approve cadence as MOM
+    actions, but NCRs never auto-close on schedule. They stay Open and keep
+    escalating every 7 days until a corrective action report is received
+    and accepted.
+    """
+    logger.info("Checking NCR reminders...")
+    try:
+        sheet = get_ncr_tracker_sheet()
+        if not sheet:
+            return
+
+        all_values = sheet.get_all_values()
+        today      = datetime.now()
+
+        for i, row in enumerate(all_values[1:], start=2):
+            try:
+                if len(row) < 7:
+                    continue
+                data = get_ncr_data_from_row(row)
+
+                if data["status"] not in ["Open", "Reminded"]:
+                    continue
+                if not data["email"] or data["email"] in ["UNKNOWN", ""]:
+                    continue
+
+                try:
+                    logged_date = datetime.strptime(data["date"], "%d.%m.%Y %H:%M")
+                except:
+                    continue
+
+                days_open      = (today - logged_date).days
+                resp_label     = data["responsible_name"] or data["contractor"]
+                reminder_count = data["reminder_count"]
+
+                reminder_due = None
+                if days_open >= REMINDER_1_DAYS and reminder_count == 0:
+                    reminder_due = 1
+                elif days_open >= REMINDER_2_DAYS and reminder_count == 1:
+                    reminder_due = 2
+                elif days_open >= REMINDER_3_DAYS and reminder_count == 2:
+                    reminder_due = 3
+                elif days_open >= REMINDER_3_DAYS and reminder_count >= 3:
+                    if data["last_reminded"]:
+                        try:
+                            last_date = datetime.strptime(data["last_reminded"], "%d.%m.%Y %H:%M")
+                            if (today - last_date).days >= 7:
+                                reminder_due = reminder_count + 1
+                        except:
+                            pass
+
+                if not reminder_due:
+                    continue
+
+                if data["last_reminded"]:
+                    try:
+                        last_date = datetime.strptime(data["last_reminded"], "%d.%m.%Y %H:%M")
+                        if (today - last_date).days < 3:
+                            continue
+                    except:
+                        pass
+
+                tone = "polite and professional" if reminder_due <= 1 else \
+                       "firm and urgent" if reminder_due == 2 else "formal escalation"
+
+                prompt = f"""Draft a {tone} reminder email to a contractor regarding an open Non-Conformance Report.
+
+NCR reference: {data['ncr_number']}
+Description: {data['description']}
+Contractor: {resp_label}
+Date raised: {data['date_raised']}
+Days open: {days_open}
+
+Start with Dear {resp_label if not data['responsible_name'] else data['responsible_name'].split()[0]},
+State clearly that this NCR remains open and will not be closed until a corrective action report addressing the non-conformance is submitted and accepted.
+Write complete formal professional email. No bullet points or symbols.
+End with:
+Alex Rivera
+Construction Expert
+SCOPE Consulting MMC
+internal@scope-iq.io"""
+
+                response = anthropic_client.messages.create(
+                    model=MODEL, max_tokens=700, system=SYSTEM_PROMPT,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                draft = response.content[0].text
+
+                approval  = f"Dear {get_first_name(data['raised_by'])},\n\n"
+                approval += f"The following NCR remains open for {days_open} days with no corrective action report received from {resp_label}.\n\n"
+                approval += f"NCR reference: {data['ncr_number']}\n"
+                approval += f"Description: {data['description']}\n"
+                approval += f"Contractor: {resp_label} ({data['email']})\n\n"
+                approval += f"I have prepared a follow-up for your approval. Please reply with approve or send to dispatch.\n\n"
+                approval += f"{'='*50}\nDRAFT — NCR FOLLOW-UP TO {resp_label.upper()}:\n{'='*50}\n\n{draft}\n\n{'='*50}\n\n"
+                approval += f"Note: This NCR will remain open regardless of reminder outcome until a corrective action report is received and accepted.\n\n"
+                approval += f"Kind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+
+                cc = [r for r in REPORT_RECIPIENTS if r.lower() != data["raised_by"].lower()]
+                ncr_reminder_html = build_ncr_reminder_html(
+                    approval, data["ncr_number"], data["description"],
+                    resp_label, data["date_raised"], days_open
+                )
+                sent = send_email(
+                    [data["raised_by"]],
+                    f"Approval Required — NCR Follow-up to {resp_label}",
+                    approval, html_body=ncr_reminder_html,
+                    cc_emails=cc, reply_to_msg_id=data["thread_id"], references=data["thread_id"]
+                )
+                if sent:
+                    update_ncr_row(i, status="Reminded",
+                                   last_reminded=today.strftime("%d.%m.%Y %H:%M"),
+                                   reminder_count=reminder_due)
+                    logger.info(f"NCR reminder {reminder_due} sent for approval: {data['ncr_number']}")
+
+            except Exception as e:
+                logger.error(f"NCR reminder row error: {e}")
+                continue
+    except Exception as e:
+        logger.error(f"NCR reminder check error: {e}")
 
 
 def check_thread_replies(thread_ids):
@@ -2383,14 +2822,110 @@ def build_external_reminder_html(body_text, meeting_ref, action_item,
 </html>"""
 
 
+def build_ncr_reminder_html(body_text, ncr_number, description,
+                            contractor_label, date_raised, days_open):
+    today    = datetime.now().strftime("%d %B %Y")
+    time_now = datetime.now().strftime("%H:%M")
+
+    paragraphs = body_text.strip().split("\n\n")
+    html_body  = ""
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        if "Alex Rivera" in para and "SCOPE Consulting" in para:
+            lines    = para.split("\n")
+            sig_html = ""
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                if "Alex Rivera" in line:
+                    sig_html += f'<div style="font-size:13px;font-weight:600;color:#1a2942;">{line}</div>'
+                elif "internal@scope-iq.io" in line:
+                    sig_html += f'<div style="font-size:12px;color:#3CB496;">{line}</div>'
+                else:
+                    sig_html += f'<div style="font-size:12px;color:#666;">{line}</div>'
+            html_body += f'<div style="margin-top:20px;padding-top:16px;border-top:1px solid #f0f0f0;line-height:1.8;">{sig_html}</div>'
+        else:
+            lines     = para.split("\n")
+            para_html = "<br>".join(line.strip() for line in lines if line.strip())
+            html_body += f'<p style="font-size:14px;color:#333;line-height:1.8;margin:0 0 16px;">{para_html}</p>'
+
+    return f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif;">
+<div style="max-width:620px;margin:0 auto;padding:20px 0;">
+
+  <div style="background:#1a2942;border-radius:12px 12px 0 0;padding:24px 28px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <div style="color:#fff;font-size:22px;font-weight:600;letter-spacing:1px;">SCOPE <span style="color:#3CB496;">IQ</span></div>
+      <div style="background:#c00000;color:#fff;font-size:11px;padding:4px 12px;border-radius:20px;font-weight:500;">NCR Follow-up</div>
+    </div>
+    <table style="width:100%;font-size:12px;border-collapse:collapse;">
+      <tr>
+        <td style="color:#8facc8;padding:2px 0;width:50%;">Date &nbsp;<strong style="color:#c8ddf0;">{today}</strong></td>
+        <td style="color:#8facc8;padding:2px 0;">Time &nbsp;<strong style="color:#c8ddf0;">{time_now} Baku</strong></td>
+      </tr>
+      <tr>
+        <td style="color:#8facc8;padding:2px 0;">Days open &nbsp;<strong style="color:#c8ddf0;">{days_open}</strong></td>
+        <td style="color:#8facc8;padding:2px 0;">NCR ref &nbsp;<strong style="color:#c8ddf0;">{ncr_number}</strong></td>
+      </tr>
+    </table>
+  </div>
+
+  <div style="background:#3a1a1a;padding:16px 28px;">
+    <div style="font-size:11px;color:#e0a8a8;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">Non-conformance under follow-up</div>
+    <div style="font-size:14px;color:#fff;font-weight:600;line-height:1.5;">{description}</div>
+  </div>
+
+  <div style="background:#fff;border:1px solid #e8e8e8;border-top:none;border-radius:0 0 12px 12px;padding:24px 28px;">
+
+    <div style="border:1px solid #e8e8e8;border-radius:8px;margin-bottom:20px;overflow:hidden;">
+      <div style="background:#f8f9fa;padding:10px 16px;border-bottom:1px solid #e8e8e8;">
+        <span style="font-size:12px;color:#888;font-weight:500;">NCR DETAILS</span>
+      </div>
+      <div style="padding:14px 16px;">
+        <table style="width:100%;font-size:13px;border-collapse:collapse;">
+          <tr><td style="color:#888;padding:4px 0;width:140px;">Contractor</td><td style="color:#1a2942;font-weight:600;">{contractor_label}</td></tr>
+          <tr><td style="color:#888;padding:4px 0;">Date raised</td><td style="color:#333;">{date_raised}</td></tr>
+          <tr><td style="color:#888;padding:4px 0;">NCR reference</td><td style="color:#333;">{ncr_number}</td></tr>
+        </table>
+      </div>
+    </div>
+
+    {html_body}
+
+    <div style="background:#fff8ee;border:1px solid #f0c060;border-radius:6px;padding:10px 14px;margin-top:12px;">
+      <div style="font-size:12px;color:#5a3a00;line-height:1.6;">
+        This NCR remains open and will not be closed until a corrective action report is received and accepted.
+      </div>
+    </div>
+
+    <div style="background:#f8f9fa;border-radius:6px;padding:10px 14px;margin-top:16px;">
+      <div style="font-size:11px;color:#888;line-height:1.6;">
+        This follow-up was prepared by <strong style="color:#1a2942;">Alex Rivera</strong>,
+        Construction Expert at SCOPE Consulting MMC, using
+        <strong style="color:#3CB496;">SCOPE IQ</strong> — Intelligent Email Monitoring.
+      </div>
+    </div>
+
+  </div>
+</div>
+</body>
+</html>"""
+
+
 def build_report_html(pending, closed, today, day_name, time_now,
-                      open_actions=None, flagged=None):
+                      open_actions=None, flagged=None, open_ncrs=None):
     n_open       = len([r for r in pending if r.get("Status") == "Open"])
     n_monitor    = len([r for r in pending if r.get("Status") == "Monitoring"])
     n_closed     = len(closed)
     open_actions = open_actions or []
     flagged      = flagged or []
-    total_open   = len(pending) + len(open_actions)
+    open_ncrs    = open_ncrs or []
+    total_open   = len(pending) + len(open_actions) + len(open_ncrs)
 
     items_html = ""
     for i, r in enumerate(pending[-15:], 1):
@@ -2460,8 +2995,43 @@ def build_report_html(pending, closed, today, day_name, time_now,
             </div>"""
         ext_html += "</div>"
 
+    ncr_html = ""
+    if open_ncrs:
+        ncr_html += """<div style="margin-top:24px;border-top:2px solid #e8e8e8;padding-top:20px;">
+        <div style="font-size:11px;font-weight:600;color:#888;letter-spacing:1px;text-transform:uppercase;margin-bottom:12px;">Open non-conformance reports</div>"""
+        for i, r in enumerate(open_ncrs[-10:], 1):
+            num     = r.get("NCR Number","") or "Unknown"
+            desc    = r.get("Description","") or "No description"
+            contr   = r.get("Contractor","") or "Unknown"
+            resname = r.get("Responsible Name","") or ""
+            e       = r.get("Contractor Email","") or "Unknown"
+            dr      = r.get("Date Raised","") or "Not specified"
+            s       = r.get("Status","") or "Open"
+            display = f"{resname} ({contr})" if resname else contr
+            status_bg = "#fff0f0" if s == "Email Unknown" else "#fff8ee"
+            status_tx = "#c00000" if s == "Email Unknown" else "#9a6000"
+            ncr_html += f"""
+            <div style="border:1px solid #e8e8e8;border-radius:8px;margin-bottom:12px;overflow:hidden;">
+              <div style="background:#3a1a1a;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;">
+                <span style="font-size:12px;color:#e0a8a8;">NCR {num}</span>
+                <span style="background:{status_bg};color:{status_tx};font-size:11px;padding:2px 8px;border-radius:20px;">{s}</span>
+              </div>
+              <div style="padding:14px;">
+                <div style="font-size:13px;color:#1a2942;font-weight:600;margin-bottom:8px;">{desc}</div>
+                <table style="width:100%;font-size:12px;border-collapse:collapse;">
+                  <tr><td style="color:#888;padding:3px 0;width:120px;">Contractor</td><td style="color:#333;">{display}</td></tr>
+                  <tr><td style="color:#888;padding:3px 0;">Email</td><td style="color:#333;">{e}</td></tr>
+                  <tr><td style="color:#888;padding:3px 0;">Date raised</td><td style="color:#333;">{dr}</td></tr>
+                </table>
+              </div>
+            </div>"""
+        ncr_html += """<div style="background:#fff8ee;border:1px solid #f0c060;border-radius:6px;padding:10px 14px;margin-top:8px;">
+          <div style="font-size:11px;color:#5a3a00;">NCRs remain open until a corrective action report is received and accepted.</div>
+        </div>"""
+        ncr_html += "</div>"
+
     no_items = ""
-    if not pending and not open_actions:
+    if not pending and not open_actions and not open_ncrs:
         no_items = """<div style="text-align:center;padding:32px;">
           <div style="width:48px;height:48px;border-radius:50%;background:#e1f5ee;margin:0 auto 12px;font-size:22px;color:#3CB496;display:flex;align-items:center;justify-content:center;">&#10003;</div>
           <div style="font-size:15px;color:#333;font-weight:500;">All clear</div>
@@ -2492,20 +3062,24 @@ def build_report_html(pending, closed, today, day_name, time_now,
   </div>
   <div style="background:#243550;padding:12px 28px;display:flex;">
     <div style="flex:1;text-align:center;border-right:1px solid #1a2942;">
-      <div style="font-size:22px;font-weight:600;color:#f0a030;">{n_open}</div>
-      <div style="font-size:11px;color:#8facc8;margin-top:2px;">Internal Open</div>
+      <div style="font-size:20px;font-weight:600;color:#f0a030;">{n_open}</div>
+      <div style="font-size:10px;color:#8facc8;margin-top:2px;">Internal Open</div>
     </div>
     <div style="flex:1;text-align:center;border-right:1px solid #1a2942;">
-      <div style="font-size:22px;font-weight:600;color:#3CB496;">{n_monitor}</div>
-      <div style="font-size:11px;color:#8facc8;margin-top:2px;">Monitoring</div>
+      <div style="font-size:20px;font-weight:600;color:#3CB496;">{n_monitor}</div>
+      <div style="font-size:10px;color:#8facc8;margin-top:2px;">Monitoring</div>
     </div>
     <div style="flex:1;text-align:center;border-right:1px solid #1a2942;">
-      <div style="font-size:22px;font-weight:600;color:#e07030;">{len(open_actions)}</div>
-      <div style="font-size:11px;color:#8facc8;margin-top:2px;">External Actions</div>
+      <div style="font-size:20px;font-weight:600;color:#e07030;">{len(open_actions)}</div>
+      <div style="font-size:10px;color:#8facc8;margin-top:2px;">External Actions</div>
+    </div>
+    <div style="flex:1;text-align:center;border-right:1px solid #1a2942;">
+      <div style="font-size:20px;font-weight:600;color:#e05050;">{len(open_ncrs)}</div>
+      <div style="font-size:10px;color:#8facc8;margin-top:2px;">Open NCRs</div>
     </div>
     <div style="flex:1;text-align:center;">
-      <div style="font-size:22px;font-weight:600;color:#6ab87a;">{n_closed}</div>
-      <div style="font-size:11px;color:#8facc8;margin-top:2px;">Closed</div>
+      <div style="font-size:20px;font-weight:600;color:#6ab87a;">{n_closed}</div>
+      <div style="font-size:10px;color:#8facc8;margin-top:2px;">Closed</div>
     </div>
   </div>
   <div style="background:#fff;border:1px solid #e8e8e8;border-top:none;border-radius:0 0 12px 12px;padding:24px 28px;">
@@ -2513,6 +3087,7 @@ def build_report_html(pending, closed, today, day_name, time_now,
     {"<div style='font-size:11px;font-weight:600;color:#888;letter-spacing:1px;text-transform:uppercase;margin-bottom:12px;'>Internal outstanding items</div>" if pending else ""}
     {items_html}
     {ext_html}
+    {ncr_html}
     {no_items}
     <div style="border-top:1px solid #f0f0f0;margin-top:24px;padding-top:20px;display:flex;justify-content:space-between;">
       <div style="font-size:12px;color:#666;line-height:1.8;">
@@ -2527,7 +3102,7 @@ def build_report_html(pending, closed, today, day_name, time_now,
     <div style="background:#f8f9fa;border-radius:6px;padding:10px 14px;margin-top:16px;">
       <div style="font-size:11px;color:#888;">
         <strong style="color:#555;">Chase protocol:</strong>
-        Draft at day 3, 7, 14 &nbsp;·&nbsp; Auto-close at day 21
+        Draft at day 3, 7, 14 &nbsp;·&nbsp; Auto-close at day 21 (NCRs remain open until resolved)
       </div>
     </div>
   </div>
@@ -2631,7 +3206,16 @@ def process_emails():
                 logger.info(f"Processing: {sender} | {subject}")
 
                 if is_cc_email:
-                    if is_internal and is_mom_email(subject, body, attachments):
+                    if is_internal and is_ncr_email(subject, body, attachments):
+                        logger.info(f"NCR in CC from internal — logging")
+                        all_with_names = []
+                        seen = set()
+                        for p in [from_with_name] + to_with_names + cc_with_names:
+                            if p["email"] and p["email"] not in seen:
+                                seen.add(p["email"])
+                                all_with_names.append(p)
+                        process_ncr_email(sender, subject, body, attachments, all_with_names, msg_id_hdr)
+                    elif is_internal and is_mom_email(subject, body, attachments):
                         logger.info(f"MOM in CC from internal — extracting actions")
                         all_with_names = []
                         seen = set()
@@ -2668,6 +3252,17 @@ def process_emails():
                         else:
                             logger.info(f"Reply matches existing MOM/action thread — routing as clarification/approval/rejection")
                             handle_mom_thread_reply(sender, body, thread_actions, msg_id_hdr, in_reply_to, references)
+                    elif is_ncr_email(subject, body, attachments):
+                        logger.info(f"NCR direct from internal — logging")
+                        all_with_names = []
+                        seen = set()
+                        for p in [from_with_name] + to_with_names + cc_with_names:
+                            if p["email"] and p["email"] not in seen:
+                                seen.add(p["email"])
+                                all_with_names.append(p)
+                        process_ncr_email(sender, subject, body, attachments, all_with_names, msg_id_hdr)
+                        save_to_memory(sender, subject, "NCR processed — see NCR Tracker",
+                                       "Review NCR Tracker", "Closed")
                     elif is_mom_email(subject, body, attachments):
                         logger.info(f"MOM direct from internal — extracting actions")
                         all_with_names = []
@@ -2744,14 +3339,16 @@ def send_morning_report():
     try:
         pending, closed          = read_memory_for_report()
         open_actions, _, flagged = read_actions_for_report()
+        open_ncrs, _              = read_ncrs_for_report()
         today    = datetime.now().strftime("%d %B %Y")
         day_name = datetime.now().strftime("%A")
         time_now = datetime.now().strftime("%H:%M")
 
         html_body  = build_report_html(pending, closed, today, day_name, time_now,
-                                       open_actions=open_actions, flagged=flagged)
-        total_open = len(pending) + len(open_actions)
-        plain      = f"SCOPE IQ Daily Report — {today}\nInternal: {len(pending)} | External: {len(open_actions)}\nAlex Rivera | SCOPE Consulting MMC"
+                                       open_actions=open_actions, flagged=flagged,
+                                       open_ncrs=open_ncrs)
+        total_open = len(pending) + len(open_actions) + len(open_ncrs)
+        plain      = f"SCOPE IQ Daily Report — {today}\nInternal: {len(pending)} | External: {len(open_actions)} | Open NCRs: {len(open_ncrs)}\nAlex Rivera | SCOPE Consulting MMC"
 
         subject_line  = f"SCOPE IQ Daily Report — {today}"
         subject_line += f" — {total_open} Open Item(s)" if total_open else " — All Clear"
@@ -2780,6 +3377,7 @@ def main():
     schedule.every(6).hours.do(check_action_approvals)
     schedule.every(6).hours.do(check_external_action_reminders)
     schedule.every(6).hours.do(check_mom_confirmation_and_rejections)
+    schedule.every(6).hours.do(check_ncr_reminders)
 
     process_emails()
 
