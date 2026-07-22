@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import imaplib
@@ -110,6 +111,13 @@ internal@scope-iq.io
 
 BAKU MARKET RATES:
 Mechanical excavation 8 to 15 AZN per cubic metre, Manual excavation 60 to 90 AZN per cubic metre, Concrete C25/30 190 to 240 AZN per cubic metre, Reinforcement 1200 to 1500 AZN per tonne, Formwork 18 to 28 AZN per square metre, External brickwork 25 to 40 AZN per square metre, Internal brickwork 20 to 32 AZN per square metre, Plastering 16 to 24 AZN per square metre, Paint 12 to 18 AZN per square metre, Ceramic tiles 25 to 40 AZN per square metre, Premium tiles 45 to 80 AZN per square metre, Gypsum partition 32 to 48 AZN per square metre, Armstrong ceiling 28 to 42 AZN per square metre, Raised access floor 55 to 85 AZN per square metre, Epoxy floor 35 to 55 AZN per square metre, Carpet tiles 40 to 70 AZN per square metre, Aluminium glazing 180 to 280 AZN per square metre, Timber door 350 to 550 AZN each, Fire door 600 to 1200 AZN each, Metal door 4500 to 6500 AZN each, Aluminium door 700 to 900 AZN each, HVAC ductwork 45 to 75 AZN per square metre, Fan coil unit 350 to 600 AZN each, Chiller 120 to 200 AZN per kW, AHU 800 to 2500 AZN each, VAV box 250 to 600 AZN each, Grille and diffuser 35 to 85 AZN each, Duct insulation 15 to 28 AZN per square metre, Plumbing pipework 25 to 55 AZN per metre, Sanitary fixture 180 to 450 AZN each, Pump 800 to 3500 AZN each, Cable tray 35 to 65 AZN per metre, LV cable 8 to 25 AZN per metre, Distribution board 800 to 3500 AZN each, Lighting fixture 45 to 120 AZN each, Emergency lighting 80 to 180 AZN each, Socket and switch 25 to 65 AZN each, Fire alarm panel 1500 to 8000 AZN each, Smoke detector 45 to 120 AZN each, Sprinkler head 25 to 55 AZN each, Sprinkler pipework 18 to 45 AZN per metre, Fire pump 3500 to 12000 AZN each, Access control 800 to 2500 AZN per door, CCTV camera 250 to 600 AZN each, Structured cabling point 85 to 180 AZN each, Concrete paving 35 to 55 AZN per square metre, Natural stone paving 85 to 150 AZN per square metre, Passenger lift 45000 to 80000 AZN each, Freight lift 60000 to 120000 AZN each."""
+
+
+def extract_emails_from_text(text):
+    if not text:
+        return []
+    pattern = r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+    return list(set(m.lower() for m in re.findall(pattern, text)))
 
 
 def get_imap_connection():
@@ -225,27 +233,31 @@ def get_ncr_tracker_sheet():
     """
     Columns:
     1  Date Logged      2  NCR Number        3  Description
-    4  Contractor        5  Contractor Email  6  Date Raised
+    4  Contractor        5  Contractor Emails (comma-separated)  6  Date Raised
     7  Status            8  Last Reminded     9  Reminder Count
     10 Thread ID         11 Raised By         12 CAR Received
     13 CAR Content       14 Notes             15 All Thread Participants
-    16 Responsible Name
+    16 Contact Names (comma-separated)        17 Client Emails (comma-separated)
     """
     try:
         client      = get_gspread_client()
         spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
         try:
-            return spreadsheet.worksheet("NCR Tracker")
+            sheet   = spreadsheet.worksheet("NCR Tracker")
+            headers = sheet.row_values(1)
+            if len(headers) < 17:
+                sheet.update_cell(1, 17, "Client Emails")
+            return sheet
         except:
             sheet = spreadsheet.add_worksheet(
-                title="NCR Tracker", rows=2000, cols=16)
+                title="NCR Tracker", rows=2000, cols=17)
             sheet.append_row([
                 "Date Logged", "NCR Number", "Description",
                 "Contractor", "Contractor Email", "Date Raised",
                 "Status", "Last Reminded", "Reminder Count",
                 "Thread ID", "Raised By", "CAR Received",
                 "CAR Content", "Notes", "All Thread Participants",
-                "Responsible Name"
+                "Responsible Name", "Client Emails"
             ])
             logger.info("Created NCR Tracker tab")
             return sheet
@@ -436,19 +448,21 @@ def update_action_row(row_number, status=None, last_reminded=None,
         logger.error(f"Update action row error: {e}")
 
 
-def save_ncr_item(ncr_number, description, contractor, contractor_email,
-                  contractor_name, date_raised, thread_id, raised_by,
-                  all_participants, status="Open"):
+def save_ncr_item(ncr_number, description, contractor, contact_emails,
+                  contact_names, date_raised, thread_id, raised_by,
+                  all_participants, client_emails, status="Open"):
     try:
         sheet = get_ncr_tracker_sheet()
         if sheet:
             sheet.append_row([
                 datetime.now().strftime("%d.%m.%Y %H:%M"),
-                ncr_number, description, contractor, contractor_email,
-                date_raised, status, "", "0", thread_id, raised_by,
-                "", "", "", ",".join(all_participants), contractor_name
+                ncr_number, description, contractor,
+                ",".join(contact_emails), date_raised, status, "", "0",
+                thread_id, raised_by, "", "", "",
+                ",".join(all_participants), ",".join(contact_names),
+                ",".join(client_emails)
             ])
-            logger.info(f"NCR saved: {ncr_number} → {contractor_name} <{contractor_email}>")
+            logger.info(f"NCR saved: {ncr_number} → {contact_names} <{contact_emails}> | Client CC: {client_emails}")
     except Exception as e:
         logger.error(f"Save NCR error: {e}")
 
@@ -479,12 +493,21 @@ def get_ncr_data_from_row(row):
     participants_raw = row[14].strip() if len(row) > 14 else ""
     all_participants = [p.strip() for p in participants_raw.split(",")
                         if p.strip() and "@" in p.strip()]
+    emails_raw = row[4].strip() if len(row) > 4 else ""
+    all_emails = [e.strip() for e in emails_raw.split(",")
+                 if e.strip() and e.strip() != "UNKNOWN"]
+    names_raw  = row[15].strip() if len(row) > 15 else ""
+    all_names  = [n.strip() for n in names_raw.split(",") if n.strip()]
+    client_raw = row[16].strip() if len(row) > 16 else ""
+    client_emails = [c.strip() for c in client_raw.split(",")
+                     if c.strip() and "@" in c.strip()]
     return {
         "date":             row[0].strip()  if row[0]        else "",
         "ncr_number":       row[1].strip()  if len(row) > 1  else "",
         "description":      row[2].strip()  if len(row) > 2  else "",
         "contractor":       row[3].strip()  if len(row) > 3  else "",
-        "email":            row[4].strip()  if len(row) > 4  else "",
+        "email":            all_emails[0] if all_emails else "UNKNOWN",
+        "all_emails":       all_emails,
         "date_raised":      row[5].strip()  if len(row) > 5  else "",
         "status":           row[6].strip()  if len(row) > 6  else "",
         "last_reminded":    row[7].strip()  if len(row) > 7  else "",
@@ -492,7 +515,9 @@ def get_ncr_data_from_row(row):
         "thread_id":        row[9].strip()  if len(row) > 9  else "",
         "raised_by":        row[10].strip() if len(row) > 10 else "",
         "all_participants": all_participants,
-        "responsible_name": row[15].strip() if len(row) > 15 else ""
+        "responsible_name": all_names[0] if all_names else "",
+        "all_names":        all_names,
+        "client_emails":    client_emails
     }
 
 
@@ -814,6 +839,62 @@ def find_open_actions_by_subject(subject):
         return []
 
 
+def find_all_open_ncrs_matching_refs(in_reply_to, references):
+    try:
+        sheet = get_ncr_tracker_sheet()
+        if not sheet:
+            return []
+        all_values = sheet.get_all_values()
+        results = []
+        for i, row in enumerate(all_values[1:], start=2):
+            if len(row) < 10:
+                continue
+            thread_id = row[9].strip() if len(row) > 9 else ""
+            status    = row[6].strip() if len(row) > 6 else ""
+            if not thread_id:
+                continue
+            if thread_id in in_reply_to or thread_id in references:
+                if status != "Closed":
+                    data = get_ncr_data_from_row(row)
+                    results.append({"row": i, **data})
+        return results
+    except Exception as e:
+        logger.error(f"Find NCR matching refs error: {e}")
+        return []
+
+
+def find_open_ncrs_by_subject(subject):
+    if not subject:
+        return []
+    clean_subject = subject.lower()
+    for prefix in ["re:", "fwd:", "fw:"]:
+        clean_subject = clean_subject.replace(prefix, "")
+    clean_subject = clean_subject.strip()
+    if not clean_subject:
+        return []
+    try:
+        sheet = get_ncr_tracker_sheet()
+        if not sheet:
+            return []
+        all_values = sheet.get_all_values()
+        matches = []
+        for i, row in enumerate(all_values[1:], start=2):
+            if len(row) < 10:
+                continue
+            ncr_number = row[1].strip() if len(row) > 1 else ""
+            status     = row[6].strip() if len(row) > 6 else ""
+            thread_id  = row[9].strip() if len(row) > 9 else ""
+            if not ncr_number or not thread_id or status == "Closed":
+                continue
+            if ncr_number.lower() in clean_subject or clean_subject in ncr_number.lower():
+                data = get_ncr_data_from_row(row)
+                matches.append({"row": i, **data})
+        return matches
+    except Exception as e:
+        logger.error(f"NCR subject fallback error: {e}")
+        return []
+
+
 def extract_mom_actions(mom_content, thread_participants_with_names, subject):
     try:
         external_participants = [
@@ -902,25 +983,26 @@ def extract_ncr_details(ncr_content, thread_participants_with_names, subject):
 
 Subject: {subject}
 
-External parties in this email thread:
+External parties in this email thread (these are the ONLY valid candidates for contractor contact — never select an internal SCOPE Consulting address):
 {fmt_list(external_participants)}
 
 NCR Content:
 {ncr_content[:12000]}
 
+IMPORTANT: The contractor is always an EXTERNAL party — never SCOPE Consulting MMC itself or any @scopeconsulting.az address. SCOPE is the PMC raising the NCR, never the party responsible for the non-conformance.
+
 Extract:
 1. NCR number or reference exactly as written
 2. Description of the non-conformance
 3. Responsible contractor company name, as labelled or clearly implied in the document
-4. Responsible email — match the contractor company name to a domain in the participants list above. If no confident match write UNKNOWN.
-5. Responsible display name — full name of the contact if known, else empty string
-6. Date raised as written, or NOT SPECIFIED
+4. All relevant contractor contacts — every external person/email from the list above who belongs to the responsible contractor's company (there may be more than one). For each provide name and email.
+5. Date raised as written, or NOT SPECIFIED
 
 Respond in this exact JSON only:
-{{"ncr_number": "...", "description": "...", "contractor": "...", "contractor_email": "...", "contractor_name": "...", "date_raised": "..."}}"""
+{{"ncr_number": "...", "description": "...", "contractor": "...", "contacts": [{{"name": "...", "email": "..."}}], "date_raised": "..."}}"""
 
         response = anthropic_client.messages.create(
-            model=MODEL, max_tokens=1000,
+            model=MODEL, max_tokens=1200,
             messages=[{"role": "user", "content": prompt}]
         )
         text = response.content[0].text.strip()
@@ -928,12 +1010,17 @@ Respond in this exact JSON only:
             text = text.split("```")[1]
             if text.startswith("json"):
                 text = text[4:]
-        return json.loads(text.strip())
+        data = json.loads(text.strip())
+
+        contacts = [c for c in data.get("contacts", [])
+                   if c.get("email") and not is_internal_email(c["email"])]
+        data["contacts"] = contacts
+        return data
     except Exception as e:
         logger.error(f"NCR extraction error: {e}")
         return {"ncr_number": "Unknown", "description": subject,
-                "contractor": "Unknown", "contractor_email": "UNKNOWN",
-                "contractor_name": "", "date_raised": "Not specified"}
+                "contractor": "Unknown", "contacts": [],
+                "date_raised": "Not specified"}
 
 
 def analyse_external_reply(action_item, reply_content):
@@ -993,6 +1080,38 @@ Respond in this exact JSON only:
     except Exception as e:
         logger.error(f"Clarification parse error: {e}")
         return {"clarifications": [], "acknowledgement_note": "NONE"}
+
+
+def extract_ncr_clarification(reply_body, ncr_summary):
+    try:
+        prompt = f"""An internal team member replied to an NCR notification with clarifications about contractor contacts.
+
+Current NCR:
+{ncr_summary}
+
+Reply received:
+{reply_body[:3000]}
+
+Extract every contractor contact name and email address mentioned in the reply — there may be one or several. Only include external contacts, never internal SCOPE Consulting MMC addresses.
+
+Respond in this exact JSON only:
+{{"contacts": [{{"name": "...", "email": "..."}}]}}"""
+
+        response = anthropic_client.messages.create(
+            model=MODEL, max_tokens=500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text = response.content[0].text.strip()
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        data = json.loads(text.strip())
+        return [c for c in data.get("contacts", [])
+               if c.get("email") and not is_internal_email(c["email"])]
+    except Exception as e:
+        logger.error(f"NCR clarification parse error: {e}")
+        return []
 
 
 def append_to_action_list_column(row_number, col, value):
@@ -1056,6 +1175,29 @@ def apply_mom_clarifications(thread_actions, clarifications):
                 append_to_action_list_column(a["row"], 15, email_)
                 updated.append(f"Updated '{a['action'][:60]}' — responsible: {name} <{email_}>")
     return updated
+
+
+def apply_ncr_clarification(ncr_row_number, new_contacts, existing_emails, existing_names):
+    emails = list(existing_emails)
+    names  = list(existing_names)
+    added  = []
+    for c in new_contacts:
+        e = c["email"].strip()
+        n = c.get("name", "").strip()
+        if e.lower() not in [x.lower() for x in emails]:
+            emails.append(e)
+            names.append(n)
+            added.append(f"{n} <{e}>" if n else e)
+    try:
+        sheet = get_ncr_tracker_sheet()
+        if sheet:
+            sheet.update_cell(ncr_row_number, 5, ",".join(emails))
+            sheet.update_cell(ncr_row_number, 16, ",".join(names))
+            if emails:
+                sheet.update_cell(ncr_row_number, 7, "Open")
+    except Exception as e:
+        logger.error(f"Apply NCR clarification error: {e}")
+    return added
 
 
 def dispatch_approved_external_draft(action_data):
@@ -1164,6 +1306,53 @@ def handle_mom_thread_reply(sender, body, thread_actions, msg_id_hdr, in_reply_t
     notice += "If no further action is required please reply no need.\n\n"
     notice += f"Kind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
     send_email([sender], f"Re: {meeting_ref}", notice,
+               html_body=build_reply_html(notice), cc_emails=cc,
+               reply_to_msg_id=msg_id_hdr, references=new_refs)
+    return True
+
+
+def handle_ncr_thread_reply(sender, body, ncr_matches, msg_id_hdr, references):
+    if not ncr_matches:
+        return False
+
+    ncr      = ncr_matches[0]
+    new_refs = f"{references} {msg_id_hdr}".strip() if references else msg_id_hdr
+    cc       = list(set(
+        [r for r in REPORT_RECIPIENTS if r.lower() != sender.lower()]
+        + ncr.get("client_emails", [])
+    ))
+
+    ncr_summary  = f"NCR {ncr['ncr_number']}: {ncr['description']} | Contractor: {ncr['contractor']} | Current contacts: {', '.join(ncr['all_emails']) or 'None'}"
+    new_contacts = extract_ncr_clarification(body, ncr_summary)
+
+    if new_contacts:
+        added = apply_ncr_clarification(ncr["row"], new_contacts, ncr["all_emails"], ncr["all_names"])
+        notice  = f"Dear {get_first_name(sender)},\n\nThank you for the clarification.\n\n"
+        if added:
+            notice += f"I have added the following contact(s) to NCR {ncr['ncr_number']}:\n\n"
+            for a in added:
+                notice += f"- {a}\n"
+        else:
+            notice += "I have noted the information provided.\n\n"
+        notice += f"\nThis NCR remains open and follow-up will continue automatically until a corrective action report is received and accepted.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+        send_email([sender], f"NCR Contacts Updated — {ncr['ncr_number']}", notice,
+                   html_body=build_reply_html(notice), cc_emails=cc,
+                   reply_to_msg_id=msg_id_hdr, references=new_refs)
+        logger.info(f"Applied {len(added)} contact(s) to NCR {ncr['ncr_number']}")
+        return True
+
+    if is_approval_reply(body):
+        notice = f"Dear {get_first_name(sender)},\n\nThank you for confirming. NCR {ncr['ncr_number']} remains open and follow-up will proceed automatically per the chase protocol until a corrective action report is received and accepted.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+        send_email([sender], f"Confirmed — NCR {ncr['ncr_number']}", notice,
+                   html_body=build_reply_html(notice), cc_emails=cc,
+                   reply_to_msg_id=msg_id_hdr, references=new_refs)
+        return True
+
+    notice  = f"Dear {get_first_name(sender)},\n\nThank you for your reply regarding NCR {ncr['ncr_number']}. "
+    notice += "I was unable to identify a specific contractor contact or clear instruction in this message. "
+    notice += "If you are providing a contact, please state the name and email address explicitly, for example: John Smith — john@contractor.az.\n\n"
+    notice += f"Kind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+    send_email([sender], f"Re: NCR {ncr['ncr_number']}", notice,
                html_body=build_reply_html(notice), cc_emails=cc,
                reply_to_msg_id=msg_id_hdr, references=new_refs)
     return True
@@ -1463,33 +1652,53 @@ def process_ncr_email(sender, subject, body, attachments,
     all_participants = [p["email"] for p in all_thread_with_names
                         if p["email"] != ZOHO_EMAIL.lower()]
 
-    resp_email = extracted.get("contractor_email", "UNKNOWN")
-    status     = "Open" if resp_email != "UNKNOWN" else "Email Unknown"
+    contacts       = extracted.get("contacts", [])
+    contact_emails = [c["email"] for c in contacts if c.get("email")]
+    contact_names  = [c.get("name", "") for c in contacts if c.get("email")]
+    status         = "Open" if contact_emails else "Email Unknown"
+
+    internal, clients, _ = classify_thread_participants(all_thread_with_names)
+    client_emails = [p["email"] for p in clients]
 
     save_ncr_item(
         extracted.get("ncr_number", "Unknown"),
         extracted.get("description", subject),
         extracted.get("contractor", "Unknown"),
-        resp_email,
-        extracted.get("contractor_name", ""),
+        contact_emails, contact_names,
         extracted.get("date_raised", "Not specified"),
-        msg_id_hdr, sender, all_participants, status
+        msg_id_hdr, sender, all_participants, client_emails, status
     )
+
+    contacts_display = "\n".join([
+        f"- {c.get('name') or c['email']} <{c['email']}>" for c in contacts
+    ]) if contacts else "No contractor contacts detected."
+
+    client_display = "\n".join([f"- {p['name']} <{p['email']}>" if p['name'] else f"- {p['email']}" for p in clients]) \
+                     if clients else "No client contacts detected in this thread."
 
     notification  = f"Dear {get_first_name(sender)},\n\n"
     notification += f"I have logged the following Non-Conformance Report in the NCR Tracker.\n\n"
     notification += f"NCR reference: {extracted.get('ncr_number', 'Unknown')}\n"
     notification += f"Description: {extracted.get('description', '')}\n"
     notification += f"Contractor identified: {extracted.get('contractor', 'Unknown')}\n"
-    notification += f"Contractor email: {resp_email}\n"
+    notification += f"Contractor contacts:\n{contacts_display}\n"
+    notification += f"Client contacts (CC for awareness):\n{client_display}\n"
     notification += f"Date raised: {extracted.get('date_raised', 'Not specified')}\n\n"
-    if resp_email == "UNKNOWN":
-        notification += f"I was unable to match the contractor to an email address. Please provide the correct contact.\n\n"
-    notification += f"This NCR will remain open and I will follow up automatically per the chase protocol until a corrective action report is received and accepted. Please reply confirmed if the details above are correct, or provide corrections.\n\n"
+    if not contact_emails:
+        notification += f"I was unable to match the contractor to a contact email. Please provide the correct contact(s).\n\n"
+    if not clients:
+        notification += f"I was also unable to identify a client contact for this NCR. Please provide the relevant client team member(s) so they can be copied for awareness.\n\n"
+    notification += f"All SCOPE team members and identified client contacts will be CC'd on every follow-up for this NCR. This NCR will remain open and I will follow up automatically per the chase protocol until a corrective action report is received and accepted. Please reply confirmed if the details above are correct, or provide additional or corrected contacts.\n\n"
     notification += f"Kind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
 
-    cc = [r for r in REPORT_RECIPIENTS if r.lower() != sender.lower()]
-    ncr_html = build_ncr_confirmation_html(sender, extracted)
+    cc = list(set(
+        [r for r in REPORT_RECIPIENTS if r.lower() != sender.lower()] + client_emails
+    ))
+    ncr_html = build_ncr_confirmation_html(sender, {
+        **extracted,
+        "contractor_email": ", ".join(contact_emails) if contact_emails else "UNKNOWN",
+        "contractor_name": ", ".join([n for n in contact_names if n])
+    })
     send_email(
         [sender], f"NCR Logged — {extracted.get('ncr_number', 'Unknown')}",
         notification, html_body=ncr_html,
@@ -1752,7 +1961,7 @@ def build_ncr_confirmation_html(sender, ncr_data):
 
     <div style="background:#f0f7ff;border:1px solid #cfe3fb;border-radius:6px;padding:12px 14px;margin-top:12px;">
       <div style="font-size:12px;color:#1a4d80;line-height:1.6;">
-        Please reply <strong>confirmed</strong> if the details above are correct, or provide corrections such as the correct contractor contact.
+        Please reply <strong>confirmed</strong> if the details above are correct, or provide corrections or additional contacts such as the correct contractor contact.
       </div>
     </div>
 
@@ -2198,12 +2407,6 @@ def check_external_action_reminders():
 
 
 def check_ncr_reminders():
-    """
-    NCR chase protocol — same Day 3/7/14 draft-and-approve cadence as MOM
-    actions, but NCRs never auto-close on schedule. They stay Open and keep
-    escalating every 7 days until a corrective action report is received
-    and accepted.
-    """
     logger.info("Checking NCR reminders...")
     try:
         sheet = get_ncr_tracker_sheet()
@@ -2221,7 +2424,7 @@ def check_ncr_reminders():
 
                 if data["status"] not in ["Open", "Reminded"]:
                     continue
-                if not data["email"] or data["email"] in ["UNKNOWN", ""]:
+                if not data["all_emails"]:
                     continue
 
                 try:
@@ -2290,13 +2493,16 @@ internal@scope-iq.io"""
                 approval += f"The following NCR remains open for {days_open} days with no corrective action report received from {resp_label}.\n\n"
                 approval += f"NCR reference: {data['ncr_number']}\n"
                 approval += f"Description: {data['description']}\n"
-                approval += f"Contractor: {resp_label} ({data['email']})\n\n"
+                approval += f"Contractor: {resp_label} ({', '.join(data['all_emails'])})\n\n"
                 approval += f"I have prepared a follow-up for your approval. Please reply with approve or send to dispatch.\n\n"
                 approval += f"{'='*50}\nDRAFT — NCR FOLLOW-UP TO {resp_label.upper()}:\n{'='*50}\n\n{draft}\n\n{'='*50}\n\n"
                 approval += f"Note: This NCR will remain open regardless of reminder outcome until a corrective action report is received and accepted.\n\n"
                 approval += f"Kind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
 
-                cc = [r for r in REPORT_RECIPIENTS if r.lower() != data["raised_by"].lower()]
+                cc = list(set(
+                    [r for r in REPORT_RECIPIENTS if r.lower() != data["raised_by"].lower()]
+                    + data.get("client_emails", [])
+                ))
                 ncr_reminder_html = build_ncr_reminder_html(
                     approval, data["ncr_number"], data["description"],
                     resp_label, data["date_raised"], days_open
@@ -2576,7 +2782,7 @@ def get_email_body(msg):
                     msg.get_content_charset() or "utf-8", errors="replace")
     except Exception as e:
         logger.error(f"Body error: {e}")
-    return body[:2000]
+    return body[:6000]
 
 
 def send_email(to_emails, subject, body, reply_to_msg_id=None,
@@ -3194,7 +3400,7 @@ def process_emails():
 
                 new_count  += 1
                 body_raw    = get_email_body(msg)
-                body        = strip_quoted_reply(body_raw)
+                body_clean  = strip_quoted_reply(body_raw)
                 attachments = extract_attachments(msg)
 
                 if attachments:
@@ -3206,7 +3412,7 @@ def process_emails():
                 logger.info(f"Processing: {sender} | {subject}")
 
                 if is_cc_email:
-                    if is_internal and is_ncr_email(subject, body, attachments):
+                    if is_internal and is_ncr_email(subject, body_raw, attachments):
                         logger.info(f"NCR in CC from internal — logging")
                         all_with_names = []
                         seen = set()
@@ -3214,8 +3420,12 @@ def process_emails():
                             if p["email"] and p["email"] not in seen:
                                 seen.add(p["email"])
                                 all_with_names.append(p)
-                        process_ncr_email(sender, subject, body, attachments, all_with_names, msg_id_hdr)
-                    elif is_internal and is_mom_email(subject, body, attachments):
+                        for scanned_email in extract_emails_from_text(body_raw):
+                            if scanned_email not in seen and scanned_email != ZOHO_EMAIL.lower():
+                                seen.add(scanned_email)
+                                all_with_names.append({"email": scanned_email, "name": ""})
+                        process_ncr_email(sender, subject, body_raw, attachments, all_with_names, msg_id_hdr)
+                    elif is_internal and is_mom_email(subject, body_raw, attachments):
                         logger.info(f"MOM in CC from internal — extracting actions")
                         all_with_names = []
                         seen = set()
@@ -3223,11 +3433,15 @@ def process_emails():
                             if p["email"] and p["email"] not in seen:
                                 seen.add(p["email"])
                                 all_with_names.append(p)
-                        process_mom_email(sender, subject, body,
+                        for scanned_email in extract_emails_from_text(body_raw):
+                            if scanned_email not in seen and scanned_email != ZOHO_EMAIL.lower():
+                                seen.add(scanned_email)
+                                all_with_names.append({"email": scanned_email, "name": ""})
+                        process_mom_email(sender, subject, body_raw,
                                           attachments, all_with_names, msg_id_hdr)
                     else:
                         logger.info(f"CC — silent log: {sender}")
-                        analysis = analyse_email(sender, subject, body,
+                        analysis = analyse_email(sender, subject, body_clean,
                                                  attachments=attachments,
                                                  memory_files=memory_files,
                                                  is_cc=True)
@@ -3243,16 +3457,23 @@ def process_emails():
                         if thread_actions:
                             logger.info(f"Matched via subject fallback (no threading headers found)")
 
+                    ncr_matches = find_all_open_ncrs_matching_refs(in_reply_to, references)
+                    if not ncr_matches:
+                        ncr_matches = find_open_ncrs_by_subject(subject)
+
                     if thread_actions:
                         draft_pending = [a for a in thread_actions if a["status"] == "Draft Pending"]
-                        if draft_pending and is_approval_reply(body) and not is_rejection_reply(body):
+                        if draft_pending and is_approval_reply(body_clean) and not is_rejection_reply(body_clean):
                             logger.info(f"Approval reply matches {len(draft_pending)} Draft Pending action(s) — dispatching to external immediately")
                             for action_data in draft_pending:
                                 dispatch_approved_external_draft(action_data)
                         else:
                             logger.info(f"Reply matches existing MOM/action thread — routing as clarification/approval/rejection")
-                            handle_mom_thread_reply(sender, body, thread_actions, msg_id_hdr, in_reply_to, references)
-                    elif is_ncr_email(subject, body, attachments):
+                            handle_mom_thread_reply(sender, body_clean, thread_actions, msg_id_hdr, in_reply_to, references)
+                    elif ncr_matches:
+                        logger.info(f"Reply matches existing NCR thread — routing as clarification/approval")
+                        handle_ncr_thread_reply(sender, body_clean, ncr_matches, msg_id_hdr, references)
+                    elif is_ncr_email(subject, body_raw, attachments):
                         logger.info(f"NCR direct from internal — logging")
                         all_with_names = []
                         seen = set()
@@ -3260,10 +3481,14 @@ def process_emails():
                             if p["email"] and p["email"] not in seen:
                                 seen.add(p["email"])
                                 all_with_names.append(p)
-                        process_ncr_email(sender, subject, body, attachments, all_with_names, msg_id_hdr)
+                        for scanned_email in extract_emails_from_text(body_raw):
+                            if scanned_email not in seen and scanned_email != ZOHO_EMAIL.lower():
+                                seen.add(scanned_email)
+                                all_with_names.append({"email": scanned_email, "name": ""})
+                        process_ncr_email(sender, subject, body_raw, attachments, all_with_names, msg_id_hdr)
                         save_to_memory(sender, subject, "NCR processed — see NCR Tracker",
                                        "Review NCR Tracker", "Closed")
-                    elif is_mom_email(subject, body, attachments):
+                    elif is_mom_email(subject, body_raw, attachments):
                         logger.info(f"MOM direct from internal — extracting actions")
                         all_with_names = []
                         seen = set()
@@ -3271,13 +3496,17 @@ def process_emails():
                             if p["email"] and p["email"] not in seen:
                                 seen.add(p["email"])
                                 all_with_names.append(p)
-                        process_mom_email(sender, subject, body,
+                        for scanned_email in extract_emails_from_text(body_raw):
+                            if scanned_email not in seen and scanned_email != ZOHO_EMAIL.lower():
+                                seen.add(scanned_email)
+                                all_with_names.append({"email": scanned_email, "name": ""})
+                        process_mom_email(sender, subject, body_raw,
                                           attachments, all_with_names, msg_id_hdr)
                         save_to_memory(sender, subject,
                                        "MOM processed — see Action Tracker",
                                        "Review Action Tracker", "Closed")
                     else:
-                        analysis = analyse_email(sender, subject, body,
+                        analysis = analyse_email(sender, subject, body_clean,
                                                  attachments=attachments,
                                                  memory_files=memory_files,
                                                  is_cc=False)
@@ -3306,7 +3535,7 @@ def process_emails():
                     if matched_action:
                         logger.info(f"Matched action — routing for internal approval")
                         route_external_reply_for_approval(
-                            sender, subject, body, matched_action, msg_id_hdr
+                            sender, subject, body_clean, matched_action, msg_id_hdr
                         )
                     else:
                         logger.info(f"Unknown external direct — logging silently")
