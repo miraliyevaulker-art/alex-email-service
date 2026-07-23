@@ -117,6 +117,10 @@ def is_short_reply(body_clean):
     return len(body_clean.split()) <= 15
 
 
+def is_daily_report_reply(subject):
+    return "daily report" in subject.lower()
+
+
 def get_gspread_client():
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds_json = os.environ.get("GOOGLE_CREDENTIALS")
@@ -899,6 +903,42 @@ Respond in this exact JSON only:
         return []
 
 
+def extract_daily_report_requests(body, open_actions, open_ncrs):
+    try:
+        def fmt_actions(lst):
+            return "\n".join([f"  - ACTION_REF:{a['row']} | {a['meeting_ref']} | {a['action'][:100]}" for a in lst]) or "  None"
+
+        def fmt_ncrs(lst):
+            return "\n".join([f"  - NCR_REF:{n['row']} | {n['ncr_number']} | {n['description'][:100]}" for n in lst]) or "  None"
+
+        prompt = f"""A team member replied to the SCOPE IQ Daily Report email with an instruction.
+
+Open MOM actions:
+{fmt_actions(open_actions)}
+
+Open NCRs:
+{fmt_ncrs(open_ncrs)}
+
+Reply received:
+{body[:2000]}
+
+Identify which item(s) the person is referring to, using the ACTION_REF or NCR_REF identifiers above, and what they want done — "reminder" (send a follow-up/chase) or "close" (no longer needed). A reply can reference multiple items.
+
+Respond in this exact JSON only:
+{{"requests": [{{"ref_type": "ACTION" or "NCR", "ref": <row number as integer>, "request": "reminder" or "close"}}]}}"""
+
+        response = anthropic_client.messages.create(model=MODEL, max_tokens=600, messages=[{"role": "user", "content": prompt}])
+        text = response.content[0].text.strip()
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"): text = text[4:]
+        data = json.loads(text.strip())
+        return data.get("requests", [])
+    except Exception as e:
+        logger.error(f"Daily report request parse error: {e}")
+        return []
+
+
 def append_to_action_list_column(row_number, col, value):
     try:
         sheet = get_action_tracker_sheet()
@@ -1087,6 +1127,107 @@ def handle_ncr_thread_reply(sender, body, ncr_matches, msg_id_hdr, references):
     notice = f"Dear {get_first_name(sender)},\n\nThank you for your reply regarding {ncr_numbers}. I was unable to identify a specific contractor contact or clear instruction in this message. If you are providing a contact, please state the name and email address explicitly, for example: John Smith — john@contractor.az.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
     send_email([sender], f"Re: {ncr_numbers}", notice, html_body=build_reply_html(notice), cc_emails=cc, reply_to_msg_id=msg_id_hdr, references=new_refs)
     return True
+
+
+def handle_daily_report_reply(sender, body, msg_id_hdr, references):
+    open_actions, _, _ = read_actions_for_report()
+    open_ncrs, _ = read_ncrs_for_report()
+
+    action_sheet = get_action_tracker_sheet()
+    ncr_sheet = get_ncr_tracker_sheet()
+    action_rows = action_sheet.get_all_values()[1:] if action_sheet else []
+    ncr_rows = ncr_sheet.get_all_values()[1:] if ncr_sheet else []
+
+    action_lookup = {}
+    for i, row in enumerate(action_rows, start=2):
+        if len(row) < 7:
+            continue
+        status = row[6].strip() if len(row) > 6 else ""
+        if status in ["Open", "Reminded", "Draft Pending"]:
+            action_lookup[i] = {"row": i, **get_action_data_from_row(row)}
+
+    ncr_lookup = {}
+    for i, row in enumerate(ncr_rows, start=2):
+        if len(row) < 7:
+            continue
+        status = row[6].strip() if len(row) > 6 else ""
+        if status in ["Open", "Reminded"]:
+            ncr_lookup[i] = {"row": i, **get_ncr_data_from_row(row)}
+
+    requests = extract_daily_report_requests(body, list(action_lookup.values()), list(ncr_lookup.values()))
+
+    if not requests:
+        notice = f"Dear {get_first_name(sender)},\n\nI could not identify a specific action item or NCR in your reply. Please reference the NCR number or a clear description of the action, for example: send reminder for NCR-0008.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+        send_email([sender], "Re: SCOPE IQ Daily Report", notice, html_body=build_reply_html(notice))
+        return
+
+    summary_lines = []
+    cc = [r for r in REPORT_RECIPIENTS if r.lower() != sender.lower()]
+
+    for req in requests:
+        ref_type = req.get("ref_type")
+        ref = req.get("ref")
+        want = req.get("request")
+
+        if ref_type == "ACTION" and ref in action_lookup:
+            data = action_lookup[ref]
+            if want == "close":
+                update_action_row(data["row"], status="Closed — No Action Required", notes=f"Closed per instruction from {sender} via daily report reply")
+                summary_lines.append(f"Closed action: {data['action'][:80]}")
+            elif want == "reminder" and data["email"] not in ["UNKNOWN", ""]:
+                reminder_count = data["reminder_count"] + 1
+                draft = draft_external_reminder(data["action"], data["responsible_name"], data["responsible"], data["due_date"], data["meeting_ref"], reminder_count, on_behalf_of=get_first_name(sender))
+                if draft:
+                    resp_label = data["responsible_name"] or data["responsible"]
+                    reminder_tag = {1: "Follow-up", 2: "Second Follow-up", 3: "Escalation Notice"}.get(reminder_count, "Follow-up")
+                    to_preview = data["email"]
+                    cc_preview = build_cc_for_external(data)
+                    approval = f"Dear {get_first_name(sender)},\n\nAs requested, I have prepared a follow-up for the action below.\n\nMeeting reference: {data['meeting_ref']}\nAction: {data['action']}\nResponsible: {resp_label} ({data['email']})\n\nPlease reply with approve or send to dispatch, or no need to cancel.\n\nWhen approved this email will be sent:\nTo: {to_preview}\nCC: {', '.join(cc_preview)}\n\n{'='*50}\nDRAFT — {reminder_tag.upper()} TO {resp_label.upper()}:\n{'='*50}\n\n{draft}\n\n{'='*50}\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+                    sent = send_email([sender], f"Approval Required — {reminder_tag} to {resp_label}", approval, html_body=build_reply_html(approval), cc_emails=cc, reply_to_msg_id=data["thread_id"], references=data["thread_id"])
+                    if sent:
+                        update_action_row(data["row"], status="Draft Pending", last_reminded=datetime.now().strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_count)
+                        summary_lines.append(f"Draft prepared and sent for approval: {data['action'][:80]}")
+
+        elif ref_type == "NCR" and ref in ncr_lookup:
+            data = ncr_lookup[ref]
+            if want == "close":
+                update_ncr_row(data["row"], status="Closed", notes=f"Closed per instruction from {sender} via daily report reply")
+                summary_lines.append(f"Closed NCR {data['ncr_number']}")
+            elif want == "reminder" and data["all_emails"]:
+                reminder_count = data["reminder_count"] + 1
+                resp_label = data["responsible_name"] or data["contractor"]
+                prompt = f"""Draft a polite and professional reminder email to a contractor regarding an open Non-Conformance Report.
+
+NCR reference: {data['ncr_number']}
+Description: {data['description']}
+Contractor: {resp_label}
+
+Start with Dear {resp_label if not data['responsible_name'] else data['responsible_name'].split()[0]},
+State clearly this NCR remains open and will not be closed until a corrective action report is submitted and accepted.
+Write complete formal professional email. No bullet points or symbols.
+End with:
+Alex Rivera
+Construction Expert
+SCOPE Consulting MMC
+internal@scope-iq.io"""
+                response = anthropic_client.messages.create(model=MODEL, max_tokens=700, system=SYSTEM_PROMPT, messages=[{"role": "user", "content": prompt}])
+                draft = response.content[0].text
+                approval = f"Dear {get_first_name(sender)},\n\nAs requested, I have prepared a follow-up for NCR {data['ncr_number']}.\n\nDescription: {data['description']}\nContractor: {resp_label} ({', '.join(data['all_emails'])})\n\nPlease reply with approve or send to dispatch.\n\n{'='*50}\nDRAFT — NCR FOLLOW-UP TO {resp_label.upper()}:\n{'='*50}\n\n{draft}\n\n{'='*50}\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+                ncr_reminder_html = build_ncr_reminder_html(approval, data["ncr_number"], data["description"], resp_label, data["date_raised"], 0)
+                sent = send_email([sender], f"Approval Required — NCR Follow-up to {resp_label}", approval, html_body=ncr_reminder_html, cc_emails=cc, reply_to_msg_id=data["thread_id"], references=data["thread_id"])
+                if sent:
+                    update_ncr_row(data["row"], status="Reminded", last_reminded=datetime.now().strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_count)
+                    summary_lines.append(f"Draft prepared and sent for approval: NCR {data['ncr_number']}")
+
+    if summary_lines:
+        notice = f"Dear {get_first_name(sender)},\n\nFollowing your reply to the Daily Report, I have taken the following action(s):\n\n"
+        for line in summary_lines:
+            notice += f"- {line}\n"
+        notice += "\nWhere a draft was prepared, please check your inbox for the separate approval email before it is sent externally.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+    else:
+        notice = f"Dear {get_first_name(sender)},\n\nI identified the item(s) referenced but could not action them — the contact email may be missing or unmatched. Please check the tracker or provide the correct contact.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+
+    send_email([sender], "Re: SCOPE IQ Daily Report", notice, html_body=build_reply_html(notice), cc_emails=cc)
 
 
 def draft_external_reminder(action_item, responsible_name, responsible_party, due_date, meeting_ref, reminder_number, outstanding=None, on_behalf_of=None):
@@ -1403,7 +1544,7 @@ def build_external_reminder_html(body_text, meeting_ref, action_item, responsibl
   <div style="background:#fff;border:1px solid #e8e8e8;border-top:none;border-radius:0 0 12px 12px;padding:24px 28px;">
     <div style="border:1px solid #e8e8e8;border-radius:8px;margin-bottom:20px;overflow:hidden;"><div style="background:#f8f9fa;padding:10px 16px;border-bottom:1px solid #e8e8e8;"><span style="font-size:12px;color:#888;font-weight:500;">ACTION DETAILS</span></div><div style="padding:14px 16px;"><table style="width:100%;font-size:13px;border-collapse:collapse;"><tr><td style="color:#888;padding:4px 0;width:130px;">Responsible</td><td style="color:#1a2942;font-weight:600;">{responsible_label}</td></tr><tr><td style="color:#888;padding:4px 0;">Due date</td><td style="color:#333;">{due_date}</td></tr><tr><td style="color:#888;padding:4px 0;">Meeting reference</td><td style="color:#333;">{meeting_ref}</td></tr></table></div></div>
     {html_body}
-    <div style="background:#f8f9fa;border-radius:6px;padding:10px 14px;margin-top:16px;"><div style="font-size:11px;color:#888;line-height:1.6;">This follow-up was prepared by <strong style="color:#1a2942;">{from_label}</strong>, Construction Expert at SCOPE Consulting MMC, using <strong style="color:#3CB496;">SCOPE IQ</strong>.</div></div>
+    <div style="background:#f8f9fa;border-radius:6px;padding:10px 14px;margin-top:16px;"><div style="font-size:11px;color:#888;line-height:1.6;">This follow-up was prepared by <strong style="color:#1a2942;">{from_label}</strong>, using <strong style="color:#3CB496;">SCOPE IQ</strong>.</div></div>
   </div>
 </div></body></html>"""
 
@@ -1551,7 +1692,7 @@ def build_report_html(pending, closed, today, day_name, time_now, open_actions=N
       <div style="font-size:12px;color:#666;line-height:1.8;"><strong style="color:#1a2942;font-size:13px;">Alex Rivera</strong><br>Construction Expert<br>SCOPE Consulting MMC<br><span style="color:#3CB496;">internal@scope-iq.io</span></div>
       <div style="font-size:11px;color:#aaa;text-align:right;line-height:1.7;">Generated automatically<br>SCOPE IQ<br>09:00 Baku daily</div>
     </div>
-    <div style="background:#f8f9fa;border-radius:6px;padding:10px 14px;margin-top:16px;"><div style="font-size:11px;color:#888;"><strong style="color:#555;">Chase protocol:</strong> Draft at day 3, 7, 14 &nbsp;·&nbsp; Auto-close at day 21 (NCRs remain open until resolved)</div></div>
+    <div style="background:#f8f9fa;border-radius:6px;padding:10px 14px;margin-top:16px;"><div style="font-size:11px;color:#888;"><strong style="color:#555;">Chase protocol:</strong> Draft at day 3, 7, 14 &nbsp;·&nbsp; Auto-close at day 21 (NCRs remain open until resolved). Reply to this report anytime with an instruction such as send reminder for NCR-0008 to trigger a follow-up on demand.</div></div>
   </div>
 </div></body></html>"""
 
@@ -2364,6 +2505,14 @@ def process_emails():
                             save_to_monitoring(sender, subject, analysis[:400], analysis[:500], msg_id_hdr, "Monitoring")
 
                 elif is_direct and is_internal:
+                    if is_daily_report_reply(subject):
+                        if sender in SCOPE_TEAM_EMAILS:
+                            handle_daily_report_reply(sender, body_clean, msg_id_hdr, references)
+                        else:
+                            logger.info(f"Daily report reply from {sender} — not in SCOPE_TEAM_EMAILS, ignoring")
+                            save_to_monitoring(sender, subject, f"Daily report reply received from unauthorised sender {sender}", "No action taken — sender not in authorised team list", msg_id_hdr, "Monitoring")
+                        continue
+
                     thread_actions = find_all_open_actions_matching_refs(in_reply_to, references)
                     if not thread_actions:
                         thread_actions = find_open_actions_by_subject(subject)
