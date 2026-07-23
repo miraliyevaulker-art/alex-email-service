@@ -433,7 +433,7 @@ def read_ncrs_for_report():
         sheet = get_ncr_tracker_sheet()
         if sheet:
             records = sheet.get_all_records()
-            open_ncrs = [r for r in records if r.get("Status") in ["Open", "Reminded", "Email Unknown"]]
+            open_ncrs = [r for r in records if r.get("Status") in ["Open", "Reminded", "Email Unknown", "Draft Pending"]]
             closed_ncrs = [r for r in records if r.get("Status") == "Closed"]
             return open_ncrs, closed_ncrs
         return [], []
@@ -730,7 +730,7 @@ def find_all_recent_open_ncrs():
                 continue
             status = row[6].strip() if len(row) > 6 else ""
             date_str = row[0].strip() if row[0] else ""
-            if status != "Open":
+            if status not in ["Open", "Reminded"]:
                 continue
             try:
                 logged_date = datetime.strptime(date_str, "%d.%m.%Y %H:%M")
@@ -742,6 +742,71 @@ def find_all_recent_open_ncrs():
         return matches
     except Exception as e:
         logger.error(f"Find recent open NCRs error: {e}")
+        return []
+
+
+def find_all_recent_open_actions_with_drafts():
+    """
+    Last-resort fallback for short confirmation replies whose threading was
+    lost. Returns all Action Tracker rows currently in Draft Pending within
+    the last 3 days, so a bare 'confirmed' reply can still trigger dispatch
+    of the correct pending draft(s).
+    """
+    try:
+        sheet = get_action_tracker_sheet()
+        if not sheet:
+            return []
+        all_values = sheet.get_all_values()
+        today = datetime.now()
+        matches = []
+        for i, row in enumerate(all_values[1:], start=2):
+            if len(row) < 10:
+                continue
+            status = row[6].strip() if len(row) > 6 else ""
+            last_reminded = row[7].strip() if len(row) > 7 else ""
+            if status != "Draft Pending":
+                continue
+            check_date = last_reminded or (row[0].strip() if row[0] else "")
+            try:
+                ref_date = datetime.strptime(check_date, "%d.%m.%Y %H:%M")
+                if (today - ref_date).days > 3:
+                    continue
+            except:
+                continue
+            matches.append({"row": i, **get_action_data_from_row(row)})
+        return matches
+    except Exception as e:
+        logger.error(f"Find recent open actions error: {e}")
+        return []
+
+
+def find_all_recent_open_ncrs_with_drafts():
+    """Same fallback but for NCR drafts pending approval."""
+    try:
+        sheet = get_ncr_tracker_sheet()
+        if not sheet:
+            return []
+        all_values = sheet.get_all_values()
+        today = datetime.now()
+        matches = []
+        for i, row in enumerate(all_values[1:], start=2):
+            if len(row) < 10:
+                continue
+            status = row[6].strip() if len(row) > 6 else ""
+            last_reminded = row[7].strip() if len(row) > 7 else ""
+            if status != "Draft Pending":
+                continue
+            check_date = last_reminded or (row[0].strip() if row[0] else "")
+            try:
+                ref_date = datetime.strptime(check_date, "%d.%m.%Y %H:%M")
+                if (today - ref_date).days > 3:
+                    continue
+            except:
+                continue
+            matches.append({"row": i, **get_ncr_data_from_row(row)})
+        return matches
+    except Exception as e:
+        logger.error(f"Find recent NCR drafts error: {e}")
         return []
 
 
@@ -1038,6 +1103,45 @@ def dispatch_approved_external_draft(action_data):
     sent = send_email(to_emails, f"Action Item Follow-up — {action_data['meeting_ref']}", draft, html_body=html_reminder, cc_emails=cc_list)
     if sent:
         update_action_row(action_data["row"], status="Reminded", last_reminded=datetime.now().strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_count, draft_sent=datetime.now().strftime("%d.%m.%Y %H:%M"))
+        logger.info(f"Dispatched action to {to_emails} CC {cc_list}")
+
+
+def dispatch_approved_ncr_draft(ncr_data):
+    """
+    Send an already-drafted NCR follow-up immediately once approval is
+    detected, mirroring dispatch_approved_external_draft for MOM actions.
+    """
+    if not ncr_data["all_emails"]:
+        return
+    resp_label = ncr_data["responsible_name"] or ncr_data["contractor"]
+    reminder_count = ncr_data["reminder_count"]
+
+    prompt = f"""Draft a polite and professional reminder email to a contractor regarding an open Non-Conformance Report.
+
+NCR reference: {ncr_data['ncr_number']}
+Description: {ncr_data['description']}
+Contractor: {resp_label}
+
+Start with Dear {resp_label if not ncr_data['responsible_name'] else ncr_data['responsible_name'].split()[0]},
+State clearly this NCR remains open and will not be closed until a corrective action report is submitted and accepted.
+Write complete formal professional email. No bullet points or symbols.
+End with:
+Alex Rivera
+Construction Expert
+SCOPE Consulting MMC
+internal@scope-iq.io"""
+
+    response = anthropic_client.messages.create(model=MODEL, max_tokens=700, system=SYSTEM_PROMPT, messages=[{"role": "user", "content": prompt}])
+    draft = response.content[0].text
+
+    cc_list = list(set(ncr_data["all_participants"] + REPORT_RECIPIENTS))
+    cc_list = [c for c in cc_list if c.lower() not in [e.lower() for e in ncr_data["all_emails"]] and c.lower() != ZOHO_EMAIL.lower()]
+
+    ncr_html = build_ncr_reminder_html(draft, ncr_data["ncr_number"], ncr_data["description"], resp_label, ncr_data["date_raised"], 0)
+    sent = send_email(ncr_data["all_emails"], f"NCR Follow-up — {ncr_data['ncr_number']}", draft, html_body=ncr_html, cc_emails=cc_list)
+    if sent:
+        update_ncr_row(ncr_data["row"], status="Reminded", last_reminded=datetime.now().strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_count + 1)
+        logger.info(f"NCR dispatched externally: {ncr_data['ncr_number']} to {ncr_data['all_emails']}")
 
 
 def handle_mom_thread_reply(sender, body, thread_actions, msg_id_hdr, in_reply_to, references):
@@ -1046,6 +1150,17 @@ def handle_mom_thread_reply(sender, body, thread_actions, msg_id_hdr, in_reply_t
     meeting_ref = thread_actions[0]["meeting_ref"]
     new_refs = f"{references} {msg_id_hdr}".strip() if references else msg_id_hdr
     cc = [r for r in REPORT_RECIPIENTS if r.lower() != sender.lower()]
+
+    draft_pending = [a for a in thread_actions if a["status"] == "Draft Pending"]
+    if draft_pending and is_approval_reply(body) and not is_rejection_reply(body):
+        for a in draft_pending:
+            dispatch_approved_external_draft(a)
+        notice = f"Dear {get_first_name(sender)},\n\nThank you for confirming. The following follow-up(s) have been sent:\n\n"
+        for a in draft_pending:
+            notice += f"- {a['action'][:80]}\n"
+        notice += "\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+        send_email([sender], f"Sent — {meeting_ref}", notice, html_body=build_reply_html(notice), cc_emails=cc, reply_to_msg_id=msg_id_hdr, references=new_refs)
+        return True
 
     if is_rejection_reply(body):
         for a in thread_actions:
@@ -1093,6 +1208,18 @@ def handle_ncr_thread_reply(sender, body, ncr_matches, msg_id_hdr, references):
     all_client_emails = list(set(e for ncr in ncr_matches for e in ncr.get("client_emails", [])))
     cc = list(set([r for r in REPORT_RECIPIENTS if r.lower() != sender.lower()] + all_client_emails))
     ncr_numbers = ", ".join([n["ncr_number"] for n in ncr_matches])
+
+    if is_approval_reply(body) and not is_rejection_reply(body):
+        draft_pending_ncrs = [n for n in ncr_matches if n["status"] == "Draft Pending"]
+        if draft_pending_ncrs:
+            for ncr in draft_pending_ncrs:
+                dispatch_approved_ncr_draft(ncr)
+            notice = f"Dear {get_first_name(sender)},\n\nThank you for confirming. The following NCR follow-up(s) have been sent to the contractor:\n\n"
+            for ncr in draft_pending_ncrs:
+                notice += f"- NCR {ncr['ncr_number']}: {ncr['description']}\n"
+            notice += "\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+            send_email([sender], f"Sent — {ncr_numbers}", notice, html_body=build_reply_html(notice), cc_emails=cc, reply_to_msg_id=msg_id_hdr, references=new_refs)
+            return True
 
     ncr_summary = "\n".join([f"NCR {n['ncr_number']}: {n['description']} | Contractor: {n['contractor']} | Current contacts: {', '.join(n['all_emails']) or 'None'}" for n in ncr_matches])
     new_contacts = extract_ncr_clarification(body, ncr_summary)
@@ -1151,7 +1278,7 @@ def handle_daily_report_reply(sender, body, msg_id_hdr, references):
         if len(row) < 7:
             continue
         status = row[6].strip() if len(row) > 6 else ""
-        if status in ["Open", "Reminded"]:
+        if status in ["Open", "Reminded", "Draft Pending"]:
             ncr_lookup[i] = {"row": i, **get_ncr_data_from_row(row)}
 
     requests = extract_daily_report_requests(body, list(action_lookup.values()), list(ncr_lookup.values()))
@@ -1216,7 +1343,7 @@ internal@scope-iq.io"""
                 ncr_reminder_html = build_ncr_reminder_html(approval, data["ncr_number"], data["description"], resp_label, data["date_raised"], 0)
                 sent = send_email([sender], f"Approval Required — NCR Follow-up to {resp_label}", approval, html_body=ncr_reminder_html, cc_emails=cc, reply_to_msg_id=data["thread_id"], references=data["thread_id"])
                 if sent:
-                    update_ncr_row(data["row"], status="Reminded", last_reminded=datetime.now().strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_count)
+                    update_ncr_row(data["row"], status="Draft Pending", last_reminded=datetime.now().strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_count)
                     summary_lines.append(f"Draft prepared and sent for approval: NCR {data['ncr_number']}")
 
     if summary_lines:
@@ -2037,7 +2164,7 @@ internal@scope-iq.io"""
                 ncr_reminder_html = build_ncr_reminder_html(approval, data["ncr_number"], data["description"], resp_label, data["date_raised"], days_open)
                 sent = send_email([data["raised_by"]], f"Approval Required — NCR Follow-up to {resp_label}", approval, html_body=ncr_reminder_html, cc_emails=cc, reply_to_msg_id=data["thread_id"], references=data["thread_id"])
                 if sent:
-                    update_ncr_row(i, status="Reminded", last_reminded=today.strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_due)
+                    update_ncr_row(i, status="Draft Pending", last_reminded=today.strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_due)
             except Exception as e:
                 logger.error(f"NCR reminder row error: {e}")
                 continue
@@ -2509,7 +2636,6 @@ def process_emails():
                         if sender in SCOPE_TEAM_EMAILS:
                             handle_daily_report_reply(sender, body_clean, msg_id_hdr, references)
                         else:
-                            logger.info(f"Daily report reply from {sender} — not in SCOPE_TEAM_EMAILS, ignoring")
                             save_to_monitoring(sender, subject, f"Daily report reply received from unauthorised sender {sender}", "No action taken — sender not in authorised team list", msg_id_hdr, "Monitoring")
                         continue
 
@@ -2522,17 +2648,28 @@ def process_emails():
                         ncr_matches = find_open_ncrs_by_subject(subject)
 
                     if thread_actions:
-                        draft_pending = [a for a in thread_actions if a["status"] == "Draft Pending"]
-                        if draft_pending and is_approval_reply(body_clean) and not is_rejection_reply(body_clean):
-                            for action_data in draft_pending:
-                                dispatch_approved_external_draft(action_data)
-                        else:
-                            handle_mom_thread_reply(sender, body_clean, thread_actions, msg_id_hdr, in_reply_to, references)
+                        handle_mom_thread_reply(sender, body_clean, thread_actions, msg_id_hdr, in_reply_to, references)
                     elif ncr_matches:
                         handle_ncr_thread_reply(sender, body_clean, ncr_matches, msg_id_hdr, references)
                     elif is_short_reply(body_clean):
+                        recent_draft_actions = find_all_recent_open_actions_with_drafts()
+                        recent_draft_ncrs = find_all_recent_open_ncrs_with_drafts()
                         all_open_ncrs = find_all_recent_open_ncrs()
-                        if all_open_ncrs:
+
+                        if (recent_draft_actions or recent_draft_ncrs) and is_approval_reply(body_clean) and not is_rejection_reply(body_clean):
+                            summary = []
+                            for a in recent_draft_actions:
+                                dispatch_approved_external_draft(a)
+                                summary.append(a['action'][:80])
+                            for n in recent_draft_ncrs:
+                                dispatch_approved_ncr_draft(n)
+                                summary.append(f"NCR {n['ncr_number']}")
+                            notice = f"Dear {get_first_name(sender)},\n\nThank you for confirming. The following follow-up(s) have been sent:\n\n"
+                            for s in summary:
+                                notice += f"- {s}\n"
+                            notice += "\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+                            send_email([sender], "Re: Approval Confirmed", notice, html_body=build_reply_html(notice))
+                        elif all_open_ncrs:
                             handle_ncr_thread_reply(sender, body_clean, all_open_ncrs, msg_id_hdr, references)
                         else:
                             save_to_monitoring(sender, subject, f"Short reply received but no matching open NCR/MOM/action found: '{body_clean[:100]}'", "Please clarify which item this reply relates to", msg_id_hdr, "Monitoring")
