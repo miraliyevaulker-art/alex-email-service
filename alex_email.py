@@ -76,6 +76,30 @@ def extract_emails_from_text(text):
     return list(set(m.lower() for m in re.findall(pattern, text)))
 
 
+def sanitize_email_list(emails):
+    """
+    Ensure every address is a bare, valid email (no embedded names, labels,
+    newlines, or extra whitespace) before handing to Resend, which requires
+    strict 'email@example.com' or 'Name <email@example.com>' format.
+    """
+    cleaned = []
+    if not emails:
+        return cleaned
+    if isinstance(emails, str):
+        emails = [emails]
+    email_pattern = re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')
+    for e in emails:
+        if not e:
+            continue
+        e = str(e).replace("\r", " ").replace("\n", " ").strip()
+        match = email_pattern.search(e)
+        if match:
+            addr = match.group(0).lower()
+            if addr not in cleaned:
+                cleaned.append(addr)
+    return cleaned
+
+
 def get_imap_connection():
     mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
     mail.socket().settimeout(IMAP_TIMEOUT)
@@ -746,12 +770,6 @@ def find_all_recent_open_ncrs():
 
 
 def find_all_recent_open_actions_with_drafts():
-    """
-    Last-resort fallback for short confirmation replies whose threading was
-    lost. Returns all Action Tracker rows currently in Draft Pending within
-    the last 3 days, so a bare 'confirmed' reply can still trigger dispatch
-    of the correct pending draft(s).
-    """
     try:
         sheet = get_action_tracker_sheet()
         if not sheet:
@@ -781,7 +799,6 @@ def find_all_recent_open_actions_with_drafts():
 
 
 def find_all_recent_open_ncrs_with_drafts():
-    """Same fallback but for NCR drafts pending approval."""
     try:
         sheet = get_ncr_tracker_sheet()
         if not sheet:
@@ -1107,10 +1124,6 @@ def dispatch_approved_external_draft(action_data):
 
 
 def dispatch_approved_ncr_draft(ncr_data):
-    """
-    Send an already-drafted NCR follow-up immediately once approval is
-    detected, mirroring dispatch_approved_external_draft for MOM actions.
-    """
     if not ncr_data["all_emails"]:
         return
     resp_label = ncr_data["responsible_name"] or ncr_data["contractor"]
@@ -2408,22 +2421,40 @@ def get_email_body(msg):
 def send_email(to_emails, subject, body, reply_to_msg_id=None, references=None, cc_emails=None, html_body=None):
     try:
         resend.api_key = RESEND_API_KEY
-        if isinstance(to_emails, str):
-            to_emails = [to_emails]
-        to_emails = [e for e in to_emails if e.lower() != ZOHO_EMAIL.lower()]
+
+        def clean_header(value):
+            if not value:
+                return value
+            return " ".join(str(value).replace("\r", " ").replace("\n", " ").split())
+
+        to_emails = sanitize_email_list(to_emails)
+        to_emails = [e for e in to_emails if e != ZOHO_EMAIL.lower()]
         if not to_emails:
+            logger.error("send_email: no valid recipient addresses after sanitizing")
             return False
+
+        subject = clean_header(subject)
+
         params = {"from": f"Alex Rivera <{ZOHO_EMAIL}>", "to": to_emails, "subject": subject, "text": body, "headers": {}}
         if html_body:
             params["html"] = html_body
+
         if cc_emails:
-            cc_emails = [e for e in cc_emails if e.lower() != ZOHO_EMAIL.lower()]
-            if cc_emails:
-                params["cc"] = cc_emails
+            cc_clean = sanitize_email_list(cc_emails)
+            cc_clean = [e for e in cc_clean if e != ZOHO_EMAIL.lower() and e not in to_emails]
+            if cc_clean:
+                params["cc"] = cc_clean
+
         if reply_to_msg_id:
-            params["headers"]["In-Reply-To"] = reply_to_msg_id
-            params["headers"]["References"] = references or reply_to_msg_id
+            clean_reply_to = clean_header(reply_to_msg_id)
+            clean_references = clean_header(references) if references else clean_reply_to
+            if clean_reply_to:
+                params["headers"]["In-Reply-To"] = clean_reply_to
+            if clean_references:
+                params["headers"]["References"] = clean_references
+
         resend.Emails.send(params)
+        logger.info(f"Sent to {to_emails} CC {params.get('cc', [])}")
         return True
     except Exception as e:
         logger.error(f"Resend error: {e}")
