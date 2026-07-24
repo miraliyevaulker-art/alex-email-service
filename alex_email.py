@@ -77,11 +77,6 @@ def extract_emails_from_text(text):
 
 
 def sanitize_email_list(emails):
-    """
-    Ensure every address is a bare, valid email (no embedded names, labels,
-    newlines, or extra whitespace) before handing to Resend, which requires
-    strict 'email@example.com' or 'Name <email@example.com>' format.
-    """
     cleaned = []
     if not emails:
         return cleaned
@@ -202,16 +197,23 @@ def get_action_tracker_sheet():
 
 
 def get_ncr_tracker_sheet():
+    """
+    Only treats a genuine 'worksheet not found' as a signal to create a new
+    sheet. Any other failure (e.g. a transient error while patching headers)
+    is logged but does not cause a duplicate-creation attempt, which was the
+    root cause of the 'sheet already exists' crash.
+    """
     try:
         client = get_gspread_client()
         spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+    except Exception as e:
+        logger.error(f"NCR tracker error (client/spreadsheet access): {e}")
+        return None
+
+    try:
+        sheet = spreadsheet.worksheet("NCR Tracker")
+    except gspread.exceptions.WorksheetNotFound:
         try:
-            sheet = spreadsheet.worksheet("NCR Tracker")
-            headers = sheet.row_values(1)
-            if len(headers) < 17:
-                sheet.update_cell(1, 17, "Client Emails")
-            return sheet
-        except:
             sheet = spreadsheet.add_worksheet(title="NCR Tracker", rows=2000, cols=17)
             sheet.append_row([
                 "Date Logged", "NCR Number", "Description", "Contractor", "Contractor Email", "Date Raised",
@@ -219,9 +221,21 @@ def get_ncr_tracker_sheet():
                 "CAR Content", "Notes", "All Thread Participants", "Responsible Name", "Client Emails"
             ])
             return sheet
+        except Exception as e:
+            logger.error(f"NCR tracker error (creating sheet): {e}")
+            return None
     except Exception as e:
-        logger.error(f"NCR tracker error: {e}")
+        logger.error(f"NCR tracker error (opening sheet): {e}")
         return None
+
+    try:
+        headers = sheet.row_values(1)
+        if len(headers) < 17:
+            sheet.update_cell(1, 17, "Client Emails")
+    except Exception as e:
+        logger.warning(f"NCR tracker header check failed (non-fatal): {e}")
+
+    return sheet
 
 
 def save_files_to_memory(sender, attachments):
@@ -440,27 +454,77 @@ def read_memory_for_report():
 def read_actions_for_report():
     try:
         sheet = get_action_tracker_sheet()
-        if sheet:
-            records = sheet.get_all_records()
-            open_actions = [r for r in records if r.get("Status") in ["Open", "Draft Pending", "Draft Sent", "Reminded"]]
-            closed = [r for r in records if r.get("Status") in ["Closed", "Closed — No Response", "Closed — No Action Required"]]
-            flagged = [r for r in records if r.get("Status") == "Email Unknown"]
-            return open_actions, closed, flagged
-        return [], [], []
+        if not sheet:
+            return [], [], []
+        all_values = sheet.get_all_values()
+        if not all_values or len(all_values) < 2:
+            return [], [], []
+
+        open_actions, closed, flagged = [], [], []
+        for row in all_values[1:]:
+            if len(row) < 7:
+                continue
+            data = get_action_data_from_row(row)
+            status = data["status"].strip()
+            record = {
+                "Action Item": data["action"],
+                "Responsible Party": data["responsible"],
+                "Responsible Name": data["responsible_name"],
+                "Responsible Email": data["email"],
+                "Due Date": data["due_date"],
+                "Status": status,
+                "Meeting Reference": data["meeting_ref"]
+            }
+            if status in ["Open", "Draft Pending", "Draft Sent", "Reminded"]:
+                open_actions.append(record)
+            elif status in ["Closed", "Closed — No Response", "Closed — No Action Required"]:
+                closed.append(record)
+            if status == "Email Unknown":
+                flagged.append(record)
+        return open_actions, closed, flagged
     except Exception as e:
         logger.error(f"Read actions error: {e}")
         return [], [], []
 
 
 def read_ncrs_for_report():
+    """
+    Reads the NCR Tracker positionally (same approach as get_ncr_data_from_row)
+    instead of relying on get_all_records(), which silently returns nothing
+    if the header row has any mismatch, duplicate, or blank cell.
+    """
     try:
         sheet = get_ncr_tracker_sheet()
-        if sheet:
-            records = sheet.get_all_records()
-            open_ncrs = [r for r in records if r.get("Status") in ["Open", "Reminded", "Email Unknown", "Draft Pending"]]
-            closed_ncrs = [r for r in records if r.get("Status") == "Closed"]
-            return open_ncrs, closed_ncrs
-        return [], []
+        if not sheet:
+            return [], []
+        all_values = sheet.get_all_values()
+        if not all_values or len(all_values) < 2:
+            return [], []
+
+        open_ncrs = []
+        closed_ncrs = []
+        for row in all_values[1:]:
+            if len(row) < 7:
+                continue
+            data = get_ncr_data_from_row(row)
+            status = data["status"].strip()
+
+            record = {
+                "NCR Number": data["ncr_number"],
+                "Description": data["description"],
+                "Contractor": data["contractor"],
+                "Responsible Name": data["responsible_name"],
+                "Contractor Email": ", ".join(data["all_emails"]) if data["all_emails"] else "UNKNOWN",
+                "Date Raised": data["date_raised"],
+                "Status": status
+            }
+
+            if status in ["Open", "Reminded", "Email Unknown", "Draft Pending"]:
+                open_ncrs.append(record)
+            elif status == "Closed":
+                closed_ncrs.append(record)
+
+        return open_ncrs, closed_ncrs
     except Exception as e:
         logger.error(f"Read NCRs error: {e}")
         return [], []
