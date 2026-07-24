@@ -199,9 +199,10 @@ def get_action_tracker_sheet():
 def get_ncr_tracker_sheet():
     """
     Only treats a genuine 'worksheet not found' as a signal to create a new
-    sheet. Any other failure (e.g. a transient error while patching headers)
-    is logged but does not cause a duplicate-creation attempt, which was the
-    root cause of the 'sheet already exists' crash.
+    sheet. Any other failure (e.g. a transient error while patching headers,
+    or the sheet not having enough columns yet) is logged but does not cause
+    a duplicate-creation attempt, which was the root cause of the earlier
+    'sheet already exists' crash.
     """
     try:
         client = get_gspread_client()
@@ -231,6 +232,8 @@ def get_ncr_tracker_sheet():
     try:
         headers = sheet.row_values(1)
         if len(headers) < 17:
+            if sheet.col_count < 17:
+                sheet.add_cols(17 - sheet.col_count)
             sheet.update_cell(1, 17, "Client Emails")
     except Exception as e:
         logger.warning(f"NCR tracker header check failed (non-fatal): {e}")
@@ -488,11 +491,6 @@ def read_actions_for_report():
 
 
 def read_ncrs_for_report():
-    """
-    Reads the NCR Tracker positionally (same approach as get_ncr_data_from_row)
-    instead of relying on get_all_records(), which silently returns nothing
-    if the header row has any mismatch, duplicate, or blank cell.
-    """
     try:
         sheet = get_ncr_tracker_sheet()
         if not sheet:
