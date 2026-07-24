@@ -201,7 +201,7 @@ def get_ncr_tracker_sheet():
     Only treats a genuine 'worksheet not found' as a signal to create a new
     sheet. Any other failure (e.g. a transient error while patching headers,
     or the sheet not having enough columns yet) is logged but does not cause
-    a duplicate-creation attempt, which was the root cause of the earlier
+    a duplicate-creation attempt, which was the root cause of an earlier
     'sheet already exists' crash.
     """
     try:
@@ -585,6 +585,46 @@ def is_ncr_email(subject, body, attachments):
         if any(kw in att.get("name", "").lower() for kw in ["ncr", "nonconformance", "non-conformance"]):
             return True
     return False
+
+
+def is_mom_subject(subject):
+    kws = ["mom", "minutes of meeting", "meeting minutes", "action items", "action points",
+           "minutes from", "meeting summary", "iclasın protokolu", "görüş protokolu"]
+    subject_low = subject.lower()
+    return any(kw in subject_low for kw in kws)
+
+
+def is_ncr_subject(subject):
+    kws = ["ncr", "non-conformance report", "non conformance report", "non-conformance",
+           "non conformance", "corrective action request", "nonconformance"]
+    subject_low = subject.lower()
+    return any(kw in subject_low for kw in kws)
+
+
+def detect_email_task_type(subject, body, attachments):
+    """
+    Subject line is the single source of truth for routing between MOM and
+    NCR workflows. Body/attachment content is only used as a fallback when
+    the subject itself gives no signal — never to override a clear subject.
+    Returns 'MOM', 'NCR', or None (meaning: neither — treat as generic).
+    """
+    mom_subj = is_mom_subject(subject)
+    ncr_subj = is_ncr_subject(subject)
+
+    if mom_subj and not ncr_subj:
+        return "MOM"
+    if ncr_subj and not mom_subj:
+        return "NCR"
+    if mom_subj and ncr_subj:
+        return None
+
+    mom_body = is_mom_email(subject, body, attachments)
+    ncr_body = is_ncr_email(subject, body, attachments)
+    if mom_body and not ncr_body:
+        return "MOM"
+    if ncr_body and not mom_body:
+        return "NCR"
+    return None
 
 
 def extract_display_name(header_value):
@@ -2699,7 +2739,8 @@ def process_emails():
                     memory_files = load_files_from_memory(sender)
 
                 if is_cc_email:
-                    if is_internal and is_ncr_email(subject, body_raw, attachments):
+                    task_type = detect_email_task_type(subject, body_raw, attachments) if is_internal else None
+                    if task_type == "NCR":
                         all_with_names = []
                         seen = set()
                         for p in [from_with_name] + to_with_names + cc_with_names:
@@ -2709,7 +2750,7 @@ def process_emails():
                             if se not in seen and se != ZOHO_EMAIL.lower():
                                 seen.add(se); all_with_names.append({"email": se, "name": ""})
                         process_ncr_email(sender, subject, body_raw, attachments, all_with_names, msg_id_hdr)
-                    elif is_internal and is_mom_email(subject, body_raw, attachments):
+                    elif task_type == "MOM":
                         all_with_names = []
                         seen = set()
                         for p in [from_with_name] + to_with_names + cc_with_names:
@@ -2766,7 +2807,7 @@ def process_emails():
                             handle_ncr_thread_reply(sender, body_clean, all_open_ncrs, msg_id_hdr, references)
                         else:
                             save_to_monitoring(sender, subject, f"Short reply received but no matching open NCR/MOM/action found: '{body_clean[:100]}'", "Please clarify which item this reply relates to", msg_id_hdr, "Monitoring")
-                    elif is_ncr_email(subject, body_raw, attachments):
+                    elif detect_email_task_type(subject, body_raw, attachments) == "NCR":
                         all_with_names = []
                         seen = set()
                         for p in [from_with_name] + to_with_names + cc_with_names:
@@ -2777,7 +2818,7 @@ def process_emails():
                                 seen.add(se); all_with_names.append({"email": se, "name": ""})
                         process_ncr_email(sender, subject, body_raw, attachments, all_with_names, msg_id_hdr)
                         save_to_memory(sender, subject, "NCR processed — see NCR Tracker", "Review NCR Tracker", "Closed")
-                    elif is_mom_email(subject, body_raw, attachments):
+                    elif detect_email_task_type(subject, body_raw, attachments) == "MOM":
                         all_with_names = []
                         seen = set()
                         for p in [from_with_name] + to_with_names + cc_with_names:
