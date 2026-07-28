@@ -1851,7 +1851,7 @@ def build_report_html(pending, closed, today, day_name, time_now, open_actions=N
     total_open = len(pending) + len(open_actions) + len(open_ncrs)
 
     items_html = ""
-    for i, r in enumerate(pending[-15:], 1):
+    for i, r in enumerate(list(reversed(pending))[:15], 1):
         subj = r.get("Subject") or "No subject"
         sender = r.get("Sender") or "Unknown"
         date = r.get("Date") or "Not recorded"
@@ -1865,7 +1865,7 @@ def build_report_html(pending, closed, today, day_name, time_now, open_actions=N
     ext_html = ""
     if open_actions:
         ext_html += '<div style="margin-top:24px;border-top:2px solid #e8e8e8;padding-top:20px;"><div style="font-size:11px;font-weight:600;color:#888;letter-spacing:1px;text-transform:uppercase;margin-bottom:12px;">External action tracker</div>'
-        for i, r in enumerate(open_actions[-10:], 1):
+        for i, r in enumerate(list(reversed(open_actions))[:10], 1):
             a = r.get("Action Item","") or "No description"
             p = r.get("Responsible Party","") or "Unknown"
             n = r.get("Responsible Name","") or ""
@@ -1882,7 +1882,7 @@ def build_report_html(pending, closed, today, day_name, time_now, open_actions=N
     ncr_html = ""
     if open_ncrs:
         ncr_html += '<div style="margin-top:24px;border-top:2px solid #e8e8e8;padding-top:20px;"><div style="font-size:11px;font-weight:600;color:#888;letter-spacing:1px;text-transform:uppercase;margin-bottom:12px;">Open non-conformance reports</div>'
-        for i, r in enumerate(open_ncrs[-10:], 1):
+        for i, r in enumerate(list(reversed(open_ncrs))[:10], 1):
             num = r.get("NCR Number","") or "Unknown"
             desc = r.get("Description","") or "No description"
             contr = r.get("Contractor","") or "Unknown"
