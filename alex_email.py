@@ -478,7 +478,7 @@ def read_actions_for_report():
                 "Status": status,
                 "Meeting Reference": data["meeting_ref"]
             }
-            if status in ["Open", "Draft Pending", "Draft Sent", "Reminded"]:
+            if status in ["Open", "Draft Pending", "Draft Sent", "Reminded", "Sending"]:
                 open_actions.append(record)
             elif status in ["Closed", "Closed — No Response", "Closed — No Action Required"]:
                 closed.append(record)
@@ -517,7 +517,7 @@ def read_ncrs_for_report():
                 "Status": status
             }
 
-            if status in ["Open", "Reminded", "Email Unknown", "Draft Pending"]:
+            if status in ["Open", "Reminded", "Email Unknown", "Draft Pending", "Sending"]:
                 open_ncrs.append(record)
             elif status == "Closed":
                 closed_ncrs.append(record)
@@ -1203,12 +1203,30 @@ def apply_ncr_clarification(ncr_row_number, new_contacts, existing_emails, exist
 
 
 def dispatch_approved_external_draft(action_data):
+    # Re-check current status directly from the sheet to prevent double-dispatch
+    # if two code paths (e.g. check_action_approvals and the short-reply
+    # fallback) both detect the same approval in the same cycle.
+    sheet = get_action_tracker_sheet()
+    if sheet:
+        try:
+            current_status = sheet.cell(action_data["row"], 7).value or ""
+            if current_status.strip() != "Draft Pending":
+                logger.info(f"Skipping dispatch — row {action_data['row']} status is now '{current_status}', not Draft Pending")
+                return
+        except Exception as e:
+            logger.warning(f"Dispatch lock check failed (proceeding anyway): {e}")
+
     reminder_count = action_data["reminder_count"] + 1
     draft = draft_external_reminder(action_data["action"], action_data["responsible_name"], action_data["responsible"],
                                     action_data["due_date"], action_data["meeting_ref"], reminder_count,
                                     on_behalf_of=get_first_name(action_data["mom_sender"]))
     if not draft or action_data["email"] in ["UNKNOWN", ""]:
         return
+
+    # Immediately flip status away from Draft Pending before sending, so any
+    # concurrent/duplicate call sees the updated status and skips.
+    update_action_row(action_data["row"], status="Sending")
+
     if not action_data["responsible_name"]:
         domain = action_data["email"].split("@")[-1] if "@" in action_data["email"] else ""
         all_to = get_all_domain_emails(domain, action_data["all_participants"])
@@ -1223,13 +1241,27 @@ def dispatch_approved_external_draft(action_data):
     if sent:
         update_action_row(action_data["row"], status="Reminded", last_reminded=datetime.now().strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_count, draft_sent=datetime.now().strftime("%d.%m.%Y %H:%M"))
         logger.info(f"Dispatched action to {to_emails} CC {cc_list}")
+    else:
+        update_action_row(action_data["row"], status="Draft Pending")
 
 
 def dispatch_approved_ncr_draft(ncr_data):
+    sheet = get_ncr_tracker_sheet()
+    if sheet:
+        try:
+            current_status = sheet.cell(ncr_data["row"], 7).value or ""
+            if current_status.strip() != "Draft Pending":
+                logger.info(f"Skipping NCR dispatch — row {ncr_data['row']} status is now '{current_status}', not Draft Pending")
+                return
+        except Exception as e:
+            logger.warning(f"NCR dispatch lock check failed (proceeding anyway): {e}")
+
     if not ncr_data["all_emails"]:
         return
     resp_label = ncr_data["responsible_name"] or ncr_data["contractor"]
     reminder_count = ncr_data["reminder_count"]
+
+    update_ncr_row(ncr_data["row"], status="Sending")
 
     prompt = f"""Draft a polite and professional reminder email to a contractor regarding an open Non-Conformance Report.
 
@@ -1257,6 +1289,8 @@ internal@scope-iq.io"""
     if sent:
         update_ncr_row(ncr_data["row"], status="Reminded", last_reminded=datetime.now().strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_count + 1)
         logger.info(f"NCR dispatched externally: {ncr_data['ncr_number']} to {ncr_data['all_emails']}")
+    else:
+        update_ncr_row(ncr_data["row"], status="Draft Pending")
 
 
 def handle_mom_thread_reply(sender, body, thread_actions, msg_id_hdr, in_reply_to, references):
@@ -2113,22 +2147,7 @@ def check_action_approvals():
                     if not (thread_id and (thread_id in in_reply_to or thread_id in references)):
                         continue
                     for action_data in action_list:
-                        reminder_count = action_data["reminder_count"] + 1
-                        draft = draft_external_reminder(action_data["action"], action_data["responsible_name"], action_data["responsible"], action_data["due_date"], action_data["meeting_ref"], reminder_count, on_behalf_of=get_first_name(action_data["mom_sender"]))
-                        if draft and action_data["email"] not in ["UNKNOWN", ""]:
-                            if not action_data["responsible_name"]:
-                                domain = action_data["email"].split("@")[-1] if "@" in action_data["email"] else ""
-                                all_to = get_all_domain_emails(domain, action_data["all_participants"])
-                                to_emails = all_to if all_to else [action_data["email"]]
-                            else:
-                                to_emails = [action_data["email"]]
-                            cc_list = build_cc_for_external(action_data)
-                            resp_label = action_data["responsible_name"] or action_data["responsible"]
-                            reminder_tag = {1: "Follow-up", 2: "Second Follow-up", 3: "Escalation Notice"}.get(reminder_count, "Follow-up")
-                            html_reminder = build_external_reminder_html(draft, action_data["meeting_ref"], action_data["action"], resp_label, action_data["due_date"], reminder_tag, on_behalf_of=get_first_name(action_data["mom_sender"]))
-                            sent = send_email(to_emails, f"Action Item Follow-up — {action_data['meeting_ref']}", draft, html_body=html_reminder, cc_emails=cc_list)
-                            if sent:
-                                update_action_row(action_data["row"], status="Reminded", last_reminded=datetime.now().strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_count, draft_sent=datetime.now().strftime("%d.%m.%Y %H:%M"))
+                        dispatch_approved_external_draft(action_data)
             except (imaplib.IMAP4.abort, OSError, EOFError):
                 safe_logout(mail)
                 try:
@@ -2172,15 +2191,20 @@ def check_external_action_reminders():
                     cc = [r for r in REPORT_RECIPIENTS if r.lower() != data["mom_sender"].lower()]
                     send_email([data["mom_sender"]], f"External Action Auto-Closed — {data['action'][:50]}", notice, html_body=build_reply_html(notice), cc_emails=cc)
                     continue
-                reminder_due = None
-                if days_open >= REMINDER_3_DAYS and data["reminder_count"] < 3:
-                    reminder_due = 3
-                elif days_open >= REMINDER_2_DAYS and data["reminder_count"] < 2:
-                    reminder_due = 2
-                elif days_open >= REMINDER_1_DAYS and data["reminder_count"] < 1:
-                    reminder_due = 1
-                if not reminder_due:
+
+                # Reminders progress strictly 1 -> 2 -> 3, one tier at a time.
+                # Never re-derived from days_open alone (which caused old
+                # items to jump straight to tier 3 repeatedly).
+                next_tier = data["reminder_count"] + 1
+                if next_tier > 3:
                     continue
+                tier_threshold = {1: REMINDER_1_DAYS, 2: REMINDER_2_DAYS, 3: REMINDER_3_DAYS}[next_tier]
+                if days_open < tier_threshold:
+                    continue
+                reminder_due = next_tier
+
+                # Hard stop: never propose a new reminder within 3 days of the
+                # last one, regardless of tier — enforces waiting sequence strictly.
                 if data["last_reminded"]:
                     try:
                         last_date = datetime.strptime(data["last_reminded"], "%d.%m.%Y %H:%M")
@@ -2188,6 +2212,7 @@ def check_external_action_reminders():
                             continue
                     except:
                         pass
+
                 tone_label = {1: "Follow-up", 2: "Second Follow-up", 3: "Escalation Notice"}[reminder_due]
                 draft = draft_external_reminder(data["action"], data["responsible_name"], data["responsible"], data["due_date"], data["meeting_ref"], reminder_due, on_behalf_of=get_first_name(data["mom_sender"]))
                 if draft:
@@ -2202,7 +2227,7 @@ def check_external_action_reminders():
                     cc = [r for r in REPORT_RECIPIENTS if r.lower() != data["mom_sender"].lower()]
                     sent = send_email([data["mom_sender"]], f"Approval Required — {tone_label} to {resp_label}", approval, html_body=build_reply_html(approval), cc_emails=cc, reply_to_msg_id=data["thread_id"], references=data["thread_id"])
                     if sent:
-                        update_action_row(i, status="Draft Pending", last_reminded=today.strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_due)
+                        update_action_row(i, status="Draft Pending", last_reminded=today.strftime("%d.%m.%Y %H:%M"))
             except Exception as e:
                 logger.error(f"External reminder row error: {e}")
                 continue
@@ -2231,23 +2256,25 @@ def check_ncr_reminders():
                 days_open = (today - logged_date).days
                 resp_label = data["responsible_name"] or data["contractor"]
                 reminder_count = data["reminder_count"]
-                reminder_due = None
-                if days_open >= REMINDER_1_DAYS and reminder_count == 0:
-                    reminder_due = 1
-                elif days_open >= REMINDER_2_DAYS and reminder_count == 1:
-                    reminder_due = 2
-                elif days_open >= REMINDER_3_DAYS and reminder_count == 2:
-                    reminder_due = 3
-                elif days_open >= REMINDER_3_DAYS and reminder_count >= 3:
+
+                next_tier = reminder_count + 1
+                if next_tier <= 3:
+                    tier_threshold = {1: REMINDER_1_DAYS, 2: REMINDER_2_DAYS, 3: REMINDER_3_DAYS}[next_tier]
+                    if days_open < tier_threshold:
+                        continue
+                    reminder_due = next_tier
+                else:
+                    reminder_due = None
                     if data["last_reminded"]:
                         try:
                             last_date = datetime.strptime(data["last_reminded"], "%d.%m.%Y %H:%M")
                             if (today - last_date).days >= 7:
-                                reminder_due = reminder_count + 1
+                                reminder_due = next_tier
                         except:
                             pass
-                if not reminder_due:
-                    continue
+                    if not reminder_due:
+                        continue
+
                 if data["last_reminded"]:
                     try:
                         last_date = datetime.strptime(data["last_reminded"], "%d.%m.%Y %H:%M")
@@ -2255,6 +2282,7 @@ def check_ncr_reminders():
                             continue
                     except:
                         pass
+
                 tone = "polite and professional" if reminder_due <= 1 else "firm and urgent" if reminder_due == 2 else "formal escalation"
                 prompt = f"""Draft a {tone} reminder email to a contractor regarding an open Non-Conformance Report.
 
@@ -2279,7 +2307,7 @@ internal@scope-iq.io"""
                 ncr_reminder_html = build_ncr_reminder_html(approval, data["ncr_number"], data["description"], resp_label, data["date_raised"], days_open)
                 sent = send_email([data["raised_by"]], f"Approval Required — NCR Follow-up to {resp_label}", approval, html_body=ncr_reminder_html, cc_emails=cc, reply_to_msg_id=data["thread_id"], references=data["thread_id"])
                 if sent:
-                    update_ncr_row(i, status="Draft Pending", last_reminded=today.strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_due)
+                    update_ncr_row(i, status="Draft Pending", last_reminded=today.strftime("%d.%m.%Y %H:%M"))
             except Exception as e:
                 logger.error(f"NCR reminder row error: {e}")
                 continue
