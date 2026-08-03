@@ -1216,6 +1216,16 @@ def dispatch_approved_external_draft(action_data):
         except Exception as e:
             logger.warning(f"Dispatch lock check failed (proceeding anyway): {e}")
 
+    # Hard cap: never dispatch beyond the intended 3 automatic reminder tiers,
+    # regardless of how the approval was triggered (scheduled check, direct
+    # reply, or short-reply fallback). This is the single point all sends
+    # funnel through, so the cap is guaranteed here even if other logic
+    # elsewhere fails to catch it.
+    if action_data["reminder_count"] >= 3:
+        logger.info(f"Skipping dispatch — row {action_data['row']} already at max reminder count ({action_data['reminder_count']})")
+        update_action_row(action_data["row"], status="Closed — No Response", notes="Reached maximum of 3 reminders; no further automatic sends.")
+        return
+
     reminder_count = action_data["reminder_count"] + 1
     draft = draft_external_reminder(action_data["action"], action_data["responsible_name"], action_data["responsible"],
                                     action_data["due_date"], action_data["meeting_ref"], reminder_count,
@@ -1258,6 +1268,12 @@ def dispatch_approved_ncr_draft(ncr_data):
 
     if not ncr_data["all_emails"]:
         return
+
+    # NCRs are allowed to escalate past 3 (with a 7-day gap, per the NCR
+    # chase protocol which never fully auto-closes), so no hard cap here —
+    # but the 3-day minimum gap is still enforced by the scheduler before a
+    # draft is ever created, and this dispatch only fires on approval.
+
     resp_label = ncr_data["responsible_name"] or ncr_data["contractor"]
     reminder_count = ncr_data["reminder_count"]
 
@@ -2192,9 +2208,6 @@ def check_external_action_reminders():
                     send_email([data["mom_sender"]], f"External Action Auto-Closed — {data['action'][:50]}", notice, html_body=build_reply_html(notice), cc_emails=cc)
                     continue
 
-                # Reminders progress strictly 1 -> 2 -> 3, one tier at a time.
-                # Never re-derived from days_open alone (which caused old
-                # items to jump straight to tier 3 repeatedly).
                 next_tier = data["reminder_count"] + 1
                 if next_tier > 3:
                     continue
@@ -2203,8 +2216,6 @@ def check_external_action_reminders():
                     continue
                 reminder_due = next_tier
 
-                # Hard stop: never propose a new reminder within 3 days of the
-                # last one, regardless of tier — enforces waiting sequence strictly.
                 if data["last_reminded"]:
                     try:
                         last_date = datetime.strptime(data["last_reminded"], "%d.%m.%Y %H:%M")
