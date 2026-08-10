@@ -9,10 +9,22 @@ import logging
 import io
 from email.header import decode_header
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from anthropic import Anthropic
 import gspread
 from google.oauth2.service_account import Credentials
 import resend
+
+BAKU_TZ = ZoneInfo("Asia/Baku")
+
+def baku_now():
+    """
+    Returns the current time in Baku, regardless of the server's own
+    timezone (Railway defaults to UTC). All date math for reminders,
+    NCR chase, and schedule milestones uses this instead of datetime.now()
+    to guarantee timing is always correct relative to Baku time.
+    """
+    return datetime.now(BAKU_TZ)
 
 ZOHO_EMAIL        = os.environ.get("ZOHO_EMAIL", "internal@scope-iq.io")
 ZOHO_APP_PASSWORD = os.environ.get("ZOHO_APP_PASSWORD")
@@ -201,8 +213,7 @@ def get_ncr_tracker_sheet():
     Only treats a genuine 'worksheet not found' as a signal to create a new
     sheet. Any other failure (e.g. a transient error while patching headers,
     or the sheet not having enough columns yet) is logged but does not cause
-    a duplicate-creation attempt, which was the root cause of an earlier
-    'sheet already exists' crash.
+    a duplicate-creation attempt.
     """
     try:
         client = get_gspread_client()
@@ -241,10 +252,40 @@ def get_ncr_tracker_sheet():
     return sheet
 
 
+def get_schedule_tracker_sheet():
+    try:
+        client = get_gspread_client()
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+    except Exception as e:
+        logger.error(f"Schedule tracker error (client/spreadsheet access): {e}")
+        return None
+
+    try:
+        sheet = spreadsheet.worksheet("Schedule Tracker")
+    except gspread.exceptions.WorksheetNotFound:
+        try:
+            sheet = spreadsheet.add_worksheet(title="Schedule Tracker", rows=2000, cols=14)
+            sheet.append_row([
+                "Date Logged", "Programme Reference", "Milestone/Activity", "Responsible Party",
+                "Responsible Email", "Responsible Name", "Planned Start Date", "Status",
+                "Last Reminded", "Reminder Count", "Thread ID", "Uploaded By",
+                "All Thread Participants", "Client Emails"
+            ])
+            return sheet
+        except Exception as e:
+            logger.error(f"Schedule tracker error (creating sheet): {e}")
+            return None
+    except Exception as e:
+        logger.error(f"Schedule tracker error (opening sheet): {e}")
+        return None
+
+    return sheet
+
+
 def save_files_to_memory(sender, attachments):
     global _file_memory_cache
     sender = sender.strip().lower()
-    _file_memory_cache[sender] = [{"name": a["name"], "content": a["content"], "saved_at": datetime.now().strftime("%d.%m.%Y %H:%M")} for a in attachments]
+    _file_memory_cache[sender] = [{"name": a["name"], "content": a["content"], "saved_at": baku_now().strftime("%d.%m.%Y %H:%M")} for a in attachments]
     try:
         sheet = get_or_create_sheet("File Memory", rows=2000, cols=4)
         if not sheet:
@@ -256,18 +297,38 @@ def save_files_to_memory(sender, attachments):
         rows_to_delete = [i + 1 for i, row in enumerate(all_values) if i > 0 and row and row[0].strip().lower() == sender]
         for r in reversed(rows_to_delete):
             sheet.delete_rows(r)
-        saved_at = datetime.now().strftime("%d.%m.%Y %H:%M")
+        saved_at = baku_now().strftime("%d.%m.%Y %H:%M")
         for att in attachments:
             sheet.append_row([sender, att["name"], att["content"][:10000], saved_at])
     except Exception as e:
         logger.error(f"Save files error: {e}")
 
 
-def load_files_from_memory(sender):
+def load_files_from_memory(sender, max_age_hours=2):
+    """
+    Only returns recently-saved files (within max_age_hours) for a sender.
+    Previously this had no expiry, meaning a file uploaded for one project
+    could be silently reused later in a completely unrelated reply from the
+    same person, producing cross-project contamination (e.g. Blok 3E data
+    bleeding into an unrelated GIG/Ruslan Hajiyev reply).
+    """
     global _file_memory_cache
     sender = sender.strip().lower()
+
+    def filter_fresh(files):
+        fresh = []
+        now = baku_now().replace(tzinfo=None)
+        for f in files:
+            try:
+                saved_at = datetime.strptime(f["saved_at"], "%d.%m.%Y %H:%M")
+                if (now - saved_at).total_seconds() / 3600 <= max_age_hours:
+                    fresh.append(f)
+            except:
+                continue
+        return fresh
+
     if sender in _file_memory_cache and _file_memory_cache[sender]:
-        return _file_memory_cache[sender]
+        return filter_fresh(_file_memory_cache[sender])
     try:
         sheet = get_or_create_sheet("File Memory", rows=2000, cols=4)
         if not sheet:
@@ -278,7 +339,7 @@ def load_files_from_memory(sender):
                 files.append({"name": row[1], "content": row[2], "saved_at": row[3] if len(row) > 3 else ""})
         if files:
             _file_memory_cache[sender] = files
-        return files
+        return filter_fresh(files)
     except Exception as e:
         logger.error(f"Load files error: {e}")
         return []
@@ -319,7 +380,7 @@ def mark_as_processed(msg_id):
     try:
         sheet = get_processed_sheet()
         if sheet:
-            sheet.append_row([msg_id, datetime.now().strftime("%d.%m.%Y %H:%M")])
+            sheet.append_row([msg_id, baku_now().strftime("%d.%m.%Y %H:%M")])
     except Exception as e:
         logger.error(f"Mark processed error: {e}")
 
@@ -338,7 +399,7 @@ def save_to_monitoring(sender, subject, summary, action, thread_id, status="Moni
             for col, name in [(7, "Thread-ID"), (8, "Last Reminded"), (9, "Reminder Count")]:
                 if len(headers) < col:
                     sheet.update_cell(1, col, name)
-            sheet.append_row([datetime.now().strftime("%d.%m.%Y %H:%M"), sender, subject, summary, action, status, thread_id, "", "0"])
+            sheet.append_row([baku_now().strftime("%d.%m.%Y %H:%M"), sender, subject, summary, action, status, thread_id, "", "0"])
     except Exception as e:
         logger.error(f"Save monitoring error: {e}")
 
@@ -347,7 +408,7 @@ def save_to_memory(sender, subject, summary, action, status="Open"):
     try:
         sheet = get_sheet("Sheet1")
         if sheet:
-            sheet.append_row([datetime.now().strftime("%d.%m.%Y %H:%M"), sender, subject, summary, action, status, "", "", "0"])
+            sheet.append_row([baku_now().strftime("%d.%m.%Y %H:%M"), sender, subject, summary, action, status, "", "", "0"])
     except Exception as e:
         logger.error(f"Save error: {e}")
 
@@ -369,7 +430,7 @@ def save_action_item(meeting_ref, action_item, responsible_party, responsible_em
         sheet = get_action_tracker_sheet()
         if sheet:
             sheet.append_row([
-                datetime.now().strftime("%d.%m.%Y %H:%M"), meeting_ref, action_item, responsible_party,
+                baku_now().strftime("%d.%m.%Y %H:%M"), meeting_ref, action_item, responsible_party,
                 responsible_email, due_date, status, "", "0", thread_id, mom_sender, "", "", "",
                 ",".join(all_participants), ",".join(client_emails), responsible_name
             ])
@@ -396,7 +457,7 @@ def save_ncr_item(ncr_number, description, contractor, contact_emails, contact_n
         sheet = get_ncr_tracker_sheet()
         if sheet:
             sheet.append_row([
-                datetime.now().strftime("%d.%m.%Y %H:%M"), ncr_number, description, contractor,
+                baku_now().strftime("%d.%m.%Y %H:%M"), ncr_number, description, contractor,
                 ",".join(contact_emails), date_raised, status, "", "0", thread_id, raised_by, "", "", "",
                 ",".join(all_participants), ",".join(contact_names), ",".join(client_emails)
             ])
@@ -418,26 +479,79 @@ def update_ncr_row(row_number, status=None, last_reminded=None, reminder_count=N
         logger.error(f"Update NCR row error: {e}")
 
 
-def get_ncr_data_from_row(row):
-    participants_raw = row[14].strip() if len(row) > 14 else ""
+def save_schedule_item(programme_ref, activity, responsible_party, responsible_email, responsible_name,
+                       planned_start, thread_id, uploaded_by, all_participants, client_emails, status="Pending",
+                       responsible_role="Contractor"):
+    try:
+        sheet = get_schedule_tracker_sheet()
+        if sheet:
+            headers = sheet.row_values(1)
+            if len(headers) < 15:
+                sheet.update_cell(1, 15, "Responsible Role")
+            sheet.append_row([
+                baku_now().strftime("%d.%m.%Y %H:%M"), programme_ref, activity, responsible_party,
+                responsible_email, responsible_name, planned_start, status, "", "0", thread_id, uploaded_by,
+                ",".join(all_participants), ",".join(client_emails), responsible_role
+            ])
+    except Exception as e:
+        logger.error(f"Save schedule item error: {e}")
+
+
+def update_schedule_row(row_number, status=None, last_reminded=None, reminder_count=None):
+    try:
+        sheet = get_schedule_tracker_sheet()
+        if sheet:
+            if status: sheet.update_cell(row_number, 8, status)
+            if last_reminded: sheet.update_cell(row_number, 9, last_reminded)
+            if reminder_count is not None: sheet.update_cell(row_number, 10, str(reminder_count))
+    except Exception as e:
+        logger.error(f"Update schedule row error: {e}")
+
+
+def get_schedule_data_from_row(row):
+    participants_raw = row[12].strip() if len(row) > 12 else ""
     all_participants = [p.strip() for p in participants_raw.split(",") if p.strip() and "@" in p.strip()]
-    emails_raw = row[4].strip() if len(row) > 4 else ""
-    all_emails = [e.strip() for e in emails_raw.split(",") if e.strip() and e.strip() != "UNKNOWN"]
-    names_raw = row[15].strip() if len(row) > 15 else ""
-    all_names = [n.strip() for n in names_raw.split(",") if n.strip()]
-    client_raw = row[16].strip() if len(row) > 16 else ""
+    client_raw = row[13].strip() if len(row) > 13 else ""
     client_emails = [c.strip() for c in client_raw.split(",") if c.strip() and "@" in c.strip()]
     return {
-        "date": row[0].strip() if row[0] else "", "ncr_number": row[1].strip() if len(row) > 1 else "",
-        "description": row[2].strip() if len(row) > 2 else "", "contractor": row[3].strip() if len(row) > 3 else "",
-        "email": all_emails[0] if all_emails else "UNKNOWN", "all_emails": all_emails,
-        "date_raised": row[5].strip() if len(row) > 5 else "", "status": row[6].strip() if len(row) > 6 else "",
-        "last_reminded": row[7].strip() if len(row) > 7 else "",
-        "reminder_count": int(row[8].strip()) if len(row) > 8 and row[8].strip().isdigit() else 0,
-        "thread_id": row[9].strip() if len(row) > 9 else "", "raised_by": row[10].strip() if len(row) > 10 else "",
-        "all_participants": all_participants, "responsible_name": all_names[0] if all_names else "",
-        "all_names": all_names, "client_emails": client_emails
+        "date_logged": row[0].strip() if row[0] else "",
+        "programme_ref": row[1].strip() if len(row) > 1 else "",
+        "activity": row[2].strip() if len(row) > 2 else "",
+        "responsible": row[3].strip() if len(row) > 3 else "",
+        "email": row[4].strip() if len(row) > 4 else "UNKNOWN",
+        "responsible_name": row[5].strip() if len(row) > 5 else "",
+        "planned_start": row[6].strip() if len(row) > 6 else "",
+        "status": row[7].strip() if len(row) > 7 else "",
+        "last_reminded": row[8].strip() if len(row) > 8 else "",
+        "reminder_count": int(row[9].strip()) if len(row) > 9 and row[9].strip().isdigit() else 0,
+        "thread_id": row[10].strip() if len(row) > 10 else "",
+        "uploaded_by": row[11].strip() if len(row) > 11 else "",
+        "all_participants": all_participants,
+        "client_emails": client_emails,
+        "responsible_role": row[14].strip() if len(row) > 14 and row[14].strip() else "Contractor"
     }
+
+
+def find_all_open_schedule_matching_refs(in_reply_to, references):
+    try:
+        sheet = get_schedule_tracker_sheet()
+        if not sheet:
+            return []
+        results = []
+        for i, row in enumerate(sheet.get_all_values()[1:], start=2):
+            if len(row) < 8:
+                continue
+            thread_id = row[10].strip() if len(row) > 10 else ""
+            status = row[7].strip() if len(row) > 7 else ""
+            if not thread_id:
+                continue
+            if thread_id in in_reply_to or thread_id in references:
+                if status not in ["Started", "Cancelled"]:
+                    results.append({"row": i, **get_schedule_data_from_row(row)})
+        return results
+    except Exception as e:
+        logger.error(f"Find schedule matching refs error: {e}")
+        return []
 
 
 def read_memory_for_report():
@@ -528,6 +642,42 @@ def read_ncrs_for_report():
         return [], []
 
 
+def read_schedule_for_report():
+    try:
+        sheet = get_schedule_tracker_sheet()
+        if not sheet:
+            return []
+        all_values = sheet.get_all_values()
+        if not all_values or len(all_values) < 2:
+            return []
+        today = baku_now().date()
+        upcoming = []
+        for row in all_values[1:]:
+            if len(row) < 8:
+                continue
+            data = get_schedule_data_from_row(row)
+            if data["status"] not in ["Pending", "Notice Sent"]:
+                continue
+            try:
+                start_date = datetime.strptime(data["planned_start"], "%d.%m.%Y").date()
+            except:
+                continue
+            days_until = (start_date - today).days
+            if 0 <= days_until <= 14:
+                upcoming.append({
+                    "Activity": data["activity"],
+                    "Responsible": data["responsible_name"] or data["responsible"],
+                    "Planned Start": data["planned_start"],
+                    "Days Until": days_until,
+                    "Status": data["status"]
+                })
+        upcoming.sort(key=lambda x: x["Days Until"])
+        return upcoming
+    except Exception as e:
+        logger.error(f"Read schedule error: {e}")
+        return []
+
+
 def get_first_name(email_address):
     try:
         local = email_address.split("@")[0]
@@ -601,21 +751,30 @@ def is_ncr_subject(subject):
     return any(kw in subject_low for kw in kws)
 
 
+def is_schedule_subject(subject):
+    kws = ["schedule", "work programme", "work program", "programme", "baseline programme",
+           "construction programme", "project schedule", "master schedule"]
+    subject_low = subject.lower()
+    return any(kw in subject_low for kw in kws)
+
+
 def detect_email_task_type(subject, body, attachments):
     """
-    Subject line is the single source of truth for routing between MOM and
-    NCR workflows. Body/attachment content is only used as a fallback when
-    the subject itself gives no signal — never to override a clear subject.
-    Returns 'MOM', 'NCR', or None (meaning: neither — treat as generic).
+    Subject line is the single source of truth for routing between MOM,
+    NCR, and SCHEDULE workflows. Body/attachment content is only used as a
+    fallback when the subject itself gives no signal for MOM/NCR — never to
+    override a clear subject. Returns 'MOM', 'NCR', 'SCHEDULE', or None.
     """
     mom_subj = is_mom_subject(subject)
     ncr_subj = is_ncr_subject(subject)
+    sched_subj = is_schedule_subject(subject)
 
-    if mom_subj and not ncr_subj:
-        return "MOM"
-    if ncr_subj and not mom_subj:
-        return "NCR"
-    if mom_subj and ncr_subj:
+    subj_hits = sum([mom_subj, ncr_subj, sched_subj])
+    if subj_hits == 1:
+        if mom_subj: return "MOM"
+        if ncr_subj: return "NCR"
+        if sched_subj: return "SCHEDULE"
+    if subj_hits > 1:
         return None
 
     mom_body = is_mom_email(subject, body, attachments)
@@ -762,6 +921,13 @@ def find_all_open_actions_matching_refs(in_reply_to, references):
 
 
 def find_open_actions_by_subject(subject):
+    """
+    Fallback matcher for when thread headers fail. Requires a much stricter
+    match than a loose substring check to avoid cross-project mixups: the
+    meeting reference must appear as a distinct token match, not just any
+    substring overlap (which previously could match unrelated references
+    sharing a common word like 'MOM' or a shared project code).
+    """
     if not subject:
         return []
     clean_subject = subject.lower()
@@ -783,7 +949,10 @@ def find_open_actions_by_subject(subject):
             thread_id = row[9].strip() if len(row) > 9 else ""
             if not meeting_ref or not thread_id or status in ["Closed", "Closed — No Response", "Closed — No Action Required"]:
                 continue
-            if meeting_ref.lower() in clean_subject or clean_subject in meeting_ref.lower():
+            meeting_ref_low = meeting_ref.lower()
+            if len(meeting_ref_low) < 6:
+                continue
+            if meeting_ref_low == clean_subject or meeting_ref_low in clean_subject or clean_subject in meeting_ref_low:
                 matches.append({"row": i, **get_action_data_from_row(row)})
         return matches
     except Exception as e:
@@ -849,7 +1018,7 @@ def find_all_recent_open_ncrs():
         if not sheet:
             return []
         all_values = sheet.get_all_values()
-        today = datetime.now()
+        today = baku_now().replace(tzinfo=None)
         matches = []
         for i, row in enumerate(all_values[1:], start=2):
             if len(row) < 10:
@@ -877,7 +1046,7 @@ def find_all_recent_open_actions_with_drafts():
         if not sheet:
             return []
         all_values = sheet.get_all_values()
-        today = datetime.now()
+        today = baku_now().replace(tzinfo=None)
         matches = []
         for i, row in enumerate(all_values[1:], start=2):
             if len(row) < 10:
@@ -906,7 +1075,7 @@ def find_all_recent_open_ncrs_with_drafts():
         if not sheet:
             return []
         all_values = sheet.get_all_values()
-        today = datetime.now()
+        today = baku_now().replace(tzinfo=None)
         matches = []
         for i, row in enumerate(all_values[1:], start=2):
             if len(row) < 10:
@@ -1014,6 +1183,47 @@ Respond in this exact JSON only:
         return {"ncr_number": "Unknown", "description": subject, "contractor": "Unknown", "contacts": [], "date_raised": "Not specified"}
 
 
+def extract_schedule_milestones(schedule_content, thread_participants_with_names, subject):
+    try:
+        external_participants = [p for p in thread_participants_with_names if p["email"] != ZOHO_EMAIL.lower() and not is_internal_email(p["email"])]
+
+        def fmt_list(lst):
+            return "\n".join([f"  - {p['name']} <{p['email']}>" if p['name'] else f"  - {p['email']}" for p in lst]) or "  None detected"
+
+        prompt = f"""Analyse this construction work programme/schedule document and extract every distinct milestone or activity that has a specific planned START date.
+
+Document subject: {subject}
+
+External parties in this email thread (match responsible party to these where possible):
+{fmt_list(external_participants)}
+
+Schedule content:
+{schedule_content[:16000]}
+
+For each milestone or major activity with a clear planned start date, extract:
+1. Activity/milestone description (concise, e.g. "MEP first fix — Level 3")
+2. Responsible party/contractor name as stated in the document
+3. Responsible email — match to external parties above by company name if possible, else UNKNOWN
+4. Responsible display name if identifiable, else blank
+5. Planned start date in DD.MM.YYYY format exactly
+6. Responsible role — classify as exactly one of: Contractor, Designer, Consultant, Supplier, Building Operator, Subcontractor. Use "Contractor" as default if genuinely unclear.
+
+Only extract items with a genuine, specific start date — skip vague date ranges, completed items, or summary/overview rows.
+
+Respond in this exact JSON only:
+{{"programme_reference": "...", "milestones": [{{"activity": "...", "responsible_party": "...", "responsible_email": "...", "responsible_name": "...", "planned_start": "DD.MM.YYYY", "responsible_role": "..."}}]}}"""
+
+        response = anthropic_client.messages.create(model=MODEL, max_tokens=3000, messages=[{"role": "user", "content": prompt}])
+        text = response.content[0].text.strip()
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"): text = text[4:]
+        return json.loads(text.strip())
+    except Exception as e:
+        logger.error(f"Schedule extraction error: {e}")
+        return {"programme_reference": subject, "milestones": []}
+
+
 def analyse_external_reply(action_item, reply_content):
     try:
         prompt = f"""Review this external party reply against a required action item.
@@ -1087,6 +1297,32 @@ Respond in this exact JSON only:
         return []
 
 
+def extract_schedule_clarification(reply_body, schedule_summary):
+    try:
+        prompt = f"""An internal team member replied to a work programme confirmation with contractor contact clarifications.
+
+Current milestone(s):
+{schedule_summary}
+
+Reply received:
+{reply_body[:3000]}
+
+Extract every contractor/responsible party contact name and email mentioned — only external contacts, never internal SCOPE addresses. Also extract which activity each contact belongs to if identifiable.
+
+Respond in this exact JSON only:
+{{"contacts": [{{"activity_hint": "...", "name": "...", "email": "..."}}]}}"""
+        response = anthropic_client.messages.create(model=MODEL, max_tokens=500, messages=[{"role": "user", "content": prompt}])
+        text = response.content[0].text.strip()
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"): text = text[4:]
+        data = json.loads(text.strip())
+        return [c for c in data.get("contacts", []) if c.get("email") and not is_internal_email(c["email"])]
+    except Exception as e:
+        logger.error(f"Schedule clarification parse error: {e}")
+        return []
+
+
 def extract_daily_report_requests(body, open_actions, open_ncrs):
     try:
         def fmt_actions(lst):
@@ -1149,6 +1385,14 @@ def update_action_contact(row_number, responsible_email=None, responsible_name=N
 
 
 def apply_mom_clarifications(thread_actions, clarifications):
+    """
+    Applies contact clarifications to Email Unknown rows within the SAME
+    thread only. The previous 'if there's only one Email Unknown row
+    globally, assign it there' fallback has been removed — it could
+    silently write a clarification meant for one project's contractor onto
+    a completely different project's action row if the global unmatched
+    count happened to be exactly one at that moment.
+    """
     updated = []
     for c in clarifications:
         name = (c.get("party_name") or "").strip()
@@ -1171,9 +1415,9 @@ def apply_mom_clarifications(thread_actions, clarifications):
                 updated.append(f"Updated '{a['action'][:60]}' — responsible: {name} <{email_}>")
                 matched_any = True
         if not matched_any:
-            unknown_rows = [a for a in thread_actions if a["status"] == "Email Unknown"]
-            if len(unknown_rows) == 1:
-                a = unknown_rows[0]
+            unknown_rows_in_thread = [a for a in thread_actions if a["status"] == "Email Unknown"]
+            if len(unknown_rows_in_thread) == 1:
+                a = unknown_rows_in_thread[0]
                 update_action_contact(a["row"], responsible_email=email_, responsible_name=name, status="Open")
                 append_to_action_list_column(a["row"], 15, email_)
                 updated.append(f"Updated '{a['action'][:60]}' — responsible: {name} <{email_}>")
@@ -1202,10 +1446,49 @@ def apply_ncr_clarification(ncr_row_number, new_contacts, existing_emails, exist
     return added
 
 
+def apply_schedule_clarifications(schedule_matches, clarifications):
+    updated = []
+    matched_row_ids = set()
+    for c in clarifications:
+        name = (c.get("name") or "").strip()
+        email_ = (c.get("email") or "").strip()
+        hint = (c.get("activity_hint") or "").strip().lower()
+        if not email_ or "@" not in email_:
+            continue
+        unknown_matches = [m for m in schedule_matches if m["email"] in ["UNKNOWN", ""] and m["row"] not in matched_row_ids]
+        target = None
+        if hint:
+            for m in unknown_matches:
+                if hint in m["activity"].lower() or m["activity"].lower() in hint:
+                    target = m
+                    break
+        if not target and len(unknown_matches) == 1:
+            target = unknown_matches[0]
+        if target:
+            try:
+                sheet = get_schedule_tracker_sheet()
+                if sheet:
+                    sheet.update_cell(target["row"], 5, email_)
+                    if name:
+                        sheet.update_cell(target["row"], 6, name)
+                matched_row_ids.add(target["row"])
+                updated.append(f"'{target['activity'][:60]}' — responsible: {name or email_} <{email_}>")
+            except Exception as e:
+                logger.error(f"Apply schedule clarification error: {e}")
+    return updated
+
+
 def dispatch_approved_external_draft(action_data):
-    # Re-check current status directly from the sheet to prevent double-dispatch
-    # if two code paths (e.g. check_action_approvals and the short-reply
-    # fallback) both detect the same approval in the same cycle.
+    """
+    Sends the follow-up externally once approved. Two independent
+    protections are enforced here, at the single point every send funnels
+    through:
+      1. Dispatch lock — re-reads live status; only proceeds if still
+         'Draft Pending', preventing double-dispatch from two code paths
+         detecting the same approval in the same cycle.
+      2. Hard cap — never dispatches beyond 3 total reminders for this
+         item, regardless of how the approval was triggered.
+    """
     sheet = get_action_tracker_sheet()
     if sheet:
         try:
@@ -1216,11 +1499,6 @@ def dispatch_approved_external_draft(action_data):
         except Exception as e:
             logger.warning(f"Dispatch lock check failed (proceeding anyway): {e}")
 
-    # Hard cap: never dispatch beyond the intended 3 automatic reminder tiers,
-    # regardless of how the approval was triggered (scheduled check, direct
-    # reply, or short-reply fallback). This is the single point all sends
-    # funnel through, so the cap is guaranteed here even if other logic
-    # elsewhere fails to catch it.
     if action_data["reminder_count"] >= 3:
         logger.info(f"Skipping dispatch — row {action_data['row']} already at max reminder count ({action_data['reminder_count']})")
         update_action_row(action_data["row"], status="Closed — No Response", notes="Reached maximum of 3 reminders; no further automatic sends.")
@@ -1233,8 +1511,6 @@ def dispatch_approved_external_draft(action_data):
     if not draft or action_data["email"] in ["UNKNOWN", ""]:
         return
 
-    # Immediately flip status away from Draft Pending before sending, so any
-    # concurrent/duplicate call sees the updated status and skips.
     update_action_row(action_data["row"], status="Sending")
 
     if not action_data["responsible_name"]:
@@ -1249,7 +1525,7 @@ def dispatch_approved_external_draft(action_data):
     html_reminder = build_external_reminder_html(draft, action_data["meeting_ref"], action_data["action"], resp_label, action_data["due_date"], reminder_tag, on_behalf_of=get_first_name(action_data["mom_sender"]))
     sent = send_email(to_emails, f"Action Item Follow-up — {action_data['meeting_ref']}", draft, html_body=html_reminder, cc_emails=cc_list)
     if sent:
-        update_action_row(action_data["row"], status="Reminded", last_reminded=datetime.now().strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_count, draft_sent=datetime.now().strftime("%d.%m.%Y %H:%M"))
+        update_action_row(action_data["row"], status="Reminded", last_reminded=baku_now().strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_count, draft_sent=baku_now().strftime("%d.%m.%Y %H:%M"))
         logger.info(f"Dispatched action to {to_emails} CC {cc_list}")
     else:
         update_action_row(action_data["row"], status="Draft Pending")
@@ -1268,11 +1544,6 @@ def dispatch_approved_ncr_draft(ncr_data):
 
     if not ncr_data["all_emails"]:
         return
-
-    # NCRs are allowed to escalate past 3 (with a 7-day gap, per the NCR
-    # chase protocol which never fully auto-closes), so no hard cap here —
-    # but the 3-day minimum gap is still enforced by the scheduler before a
-    # draft is ever created, and this dispatch only fires on approval.
 
     resp_label = ncr_data["responsible_name"] or ncr_data["contractor"]
     reminder_count = ncr_data["reminder_count"]
@@ -1303,10 +1574,72 @@ internal@scope-iq.io"""
     ncr_html = build_ncr_reminder_html(draft, ncr_data["ncr_number"], ncr_data["description"], resp_label, ncr_data["date_raised"], 0)
     sent = send_email(ncr_data["all_emails"], f"NCR Follow-up — {ncr_data['ncr_number']}", draft, html_body=ncr_html, cc_emails=cc_list)
     if sent:
-        update_ncr_row(ncr_data["row"], status="Reminded", last_reminded=datetime.now().strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_count + 1)
+        update_ncr_row(ncr_data["row"], status="Reminded", last_reminded=baku_now().strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_count + 1)
         logger.info(f"NCR dispatched externally: {ncr_data['ncr_number']} to {ncr_data['all_emails']}")
     else:
         update_ncr_row(ncr_data["row"], status="Draft Pending")
+
+
+def dispatch_approved_schedule_draft(schedule_data):
+    """
+    Sends the milestone notice externally once approved. Hard cap: exactly
+    two notices per milestone (7-day, 3-day) — never more, per explicit
+    instruction.
+    """
+    sheet = get_schedule_tracker_sheet()
+    if sheet:
+        try:
+            current_status = sheet.cell(schedule_data["row"], 8).value or ""
+            if current_status.strip() != "Draft Pending":
+                logger.info(f"Skipping schedule dispatch — row {schedule_data['row']} status is now '{current_status}', not Draft Pending")
+                return
+        except Exception as e:
+            logger.warning(f"Schedule dispatch lock check failed (proceeding anyway): {e}")
+
+    if schedule_data["reminder_count"] >= 2:
+        logger.info(f"Skipping schedule dispatch — row {schedule_data['row']} already at max notice count (2)")
+        update_schedule_row(schedule_data["row"], status="Notice Sent")
+        return
+
+    if schedule_data["email"] in ["UNKNOWN", ""]:
+        return
+
+    tier = schedule_data["reminder_count"] + 1
+    tone_label = "Advance Notice" if tier == 1 else "Final Reminder"
+    resp_label = schedule_data["responsible_name"] or schedule_data["responsible"]
+    role = schedule_data.get("responsible_role", "Contractor")
+    days_until = tier_days_until(schedule_data["planned_start"])
+
+    update_schedule_row(schedule_data["row"], status="Sending")
+
+    prompt = f"""Draft a {"polite advance" if tier == 1 else "firm final"} notice email regarding an upcoming milestone start date per the agreed work programme.
+
+Programme reference: {schedule_data['programme_ref']}
+Activity: {schedule_data['activity']}
+Responsible: {resp_label}
+Planned start date: {schedule_data['planned_start']}
+
+Start with Dear {resp_label if not schedule_data['responsible_name'] else schedule_data['responsible_name'].split()[0]},
+State clearly this activity is due to start on {schedule_data['planned_start']} per the agreed work programme, and request general confirmation of readiness to proceed.
+Write complete formal professional email. No bullet points or symbols.
+End with:
+Alex Rivera
+Construction Expert
+SCOPE Consulting MMC
+internal@scope-iq.io"""
+    response = anthropic_client.messages.create(model=MODEL, max_tokens=700, system=SYSTEM_PROMPT, messages=[{"role": "user", "content": prompt}])
+    draft = response.content[0].text
+
+    cc_list = list(set(schedule_data["all_participants"] + REPORT_RECIPIENTS))
+    cc_list = [c for c in cc_list if c.lower() != schedule_data["email"].lower() and c.lower() != ZOHO_EMAIL.lower()]
+
+    notice_html = build_schedule_notice_html(draft, schedule_data["programme_ref"], schedule_data["activity"], resp_label, role, schedule_data["planned_start"], tone_label, days_until)
+    sent = send_email([schedule_data["email"]], f"{tone_label} — {schedule_data['activity'][:60]}", draft, html_body=notice_html, cc_emails=cc_list)
+    if sent:
+        update_schedule_row(schedule_data["row"], status="Notice Sent", last_reminded=baku_now().strftime("%d.%m.%Y %H:%M"), reminder_count=tier)
+        logger.info(f"Schedule notice dispatched: {schedule_data['activity']} to {schedule_data['email']}")
+    else:
+        update_schedule_row(schedule_data["row"], status="Pending")
 
 
 def handle_mom_thread_reply(sender, body, thread_actions, msg_id_hdr, in_reply_to, references):
@@ -1421,6 +1754,52 @@ def handle_ncr_thread_reply(sender, body, ncr_matches, msg_id_hdr, references):
     return True
 
 
+def handle_schedule_thread_reply(sender, body, schedule_matches, msg_id_hdr, references):
+    if not schedule_matches:
+        return False
+    new_refs = f"{references} {msg_id_hdr}".strip() if references else msg_id_hdr
+    all_client_emails = list(set(e for s in schedule_matches for e in s.get("client_emails", [])))
+    cc = list(set([r for r in REPORT_RECIPIENTS if r.lower() != sender.lower()] + all_client_emails))
+    programme_ref = schedule_matches[0]["programme_ref"]
+
+    if is_approval_reply(body) and not is_rejection_reply(body):
+        draft_pending = [s for s in schedule_matches if s["status"] == "Draft Pending"]
+        if draft_pending:
+            for s in draft_pending:
+                dispatch_approved_schedule_draft(s)
+            notice = f"Dear {get_first_name(sender)},\n\nThank you for confirming. The following milestone notice(s) have been sent:\n\n"
+            for s in draft_pending:
+                notice += f"- {s['activity'][:80]}\n"
+            notice += "\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+            send_email([sender], f"Sent — {programme_ref}", notice, html_body=build_reply_html(notice), cc_emails=cc, reply_to_msg_id=msg_id_hdr, references=new_refs)
+            return True
+
+    schedule_summary = "\n".join([f"- {s['activity']} | Responsible: {s['responsible']} | Current contact: {s['email'] if s['email'] != 'UNKNOWN' else 'None'}" for s in schedule_matches])
+    new_contacts = extract_schedule_clarification(body, schedule_summary)
+
+    if new_contacts:
+        updated = apply_schedule_clarifications(schedule_matches, new_contacts)
+        notice = f"Dear {get_first_name(sender)},\n\nThank you for the clarification.\n\n"
+        if updated:
+            notice += "I have updated the Schedule Tracker as follows:\n\n"
+            for s in updated:
+                notice += f"- {s}\n"
+        else:
+            notice += "I have noted the information provided.\n\n"
+        notice += "\nAdvance notices will be sent 7 days and 3 days before each milestone's planned start date, subject to your approval.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+        send_email([sender], f"Schedule Contacts Updated — {programme_ref}", notice, html_body=build_reply_html(notice), cc_emails=cc, reply_to_msg_id=msg_id_hdr, references=new_refs)
+        return True
+
+    if is_approval_reply(body):
+        notice = f"Dear {get_first_name(sender)},\n\nThank you for confirming. The work programme has been logged and milestones will be tracked accordingly.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+        send_email([sender], f"Confirmed — {programme_ref}", notice, html_body=build_reply_html(notice), cc_emails=cc, reply_to_msg_id=msg_id_hdr, references=new_refs)
+        return True
+
+    notice = f"Dear {get_first_name(sender)},\n\nThank you for your reply regarding {programme_ref}. I was unable to identify a specific contractor contact or clear instruction in this message. If you are providing a contact, please state the activity, name, and email address explicitly.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+    send_email([sender], f"Re: {programme_ref}", notice, html_body=build_reply_html(notice), cc_emails=cc, reply_to_msg_id=msg_id_hdr, references=new_refs)
+    return True
+
+
 def handle_daily_report_reply(sender, body, msg_id_hdr, references):
     open_actions, _, _ = read_actions_for_report()
     open_ncrs, _ = read_ncrs_for_report()
@@ -1477,7 +1856,7 @@ def handle_daily_report_reply(sender, body, msg_id_hdr, references):
                     approval = f"Dear {get_first_name(sender)},\n\nAs requested, I have prepared a follow-up for the action below.\n\nMeeting reference: {data['meeting_ref']}\nAction: {data['action']}\nResponsible: {resp_label} ({data['email']})\n\nPlease reply with approve or send to dispatch, or no need to cancel.\n\nWhen approved this email will be sent:\nTo: {to_preview}\nCC: {', '.join(cc_preview)}\n\n{'='*50}\nDRAFT — {reminder_tag.upper()} TO {resp_label.upper()}:\n{'='*50}\n\n{draft}\n\n{'='*50}\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
                     sent = send_email([sender], f"Approval Required — {reminder_tag} to {resp_label}", approval, html_body=build_reply_html(approval), cc_emails=cc, reply_to_msg_id=data["thread_id"], references=data["thread_id"])
                     if sent:
-                        update_action_row(data["row"], status="Draft Pending", last_reminded=datetime.now().strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_count)
+                        update_action_row(data["row"], status="Draft Pending", last_reminded=baku_now().strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_count)
                         summary_lines.append(f"Draft prepared and sent for approval: {data['action'][:80]}")
 
         elif ref_type == "NCR" and ref in ncr_lookup:
@@ -1508,7 +1887,7 @@ internal@scope-iq.io"""
                 ncr_reminder_html = build_ncr_reminder_html(approval, data["ncr_number"], data["description"], resp_label, data["date_raised"], 0)
                 sent = send_email([sender], f"Approval Required — NCR Follow-up to {resp_label}", approval, html_body=ncr_reminder_html, cc_emails=cc, reply_to_msg_id=data["thread_id"], references=data["thread_id"])
                 if sent:
-                    update_ncr_row(data["row"], status="Draft Pending", last_reminded=datetime.now().strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_count)
+                    update_ncr_row(data["row"], status="Draft Pending", last_reminded=baku_now().strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_count)
                     summary_lines.append(f"Draft prepared and sent for approval: NCR {data['ncr_number']}")
 
     if summary_lines:
@@ -1570,6 +1949,28 @@ def get_action_data_from_row(row):
         "thread_id": row[9].strip() if len(row) > 9 else "", "mom_sender": row[10].strip() if len(row) > 10 else "",
         "all_participants": all_participants, "client_emails": client_emails,
         "responsible_name": row[16].strip() if len(row) > 16 else ""
+    }
+
+
+def get_ncr_data_from_row(row):
+    participants_raw = row[14].strip() if len(row) > 14 else ""
+    all_participants = [p.strip() for p in participants_raw.split(",") if p.strip() and "@" in p.strip()]
+    emails_raw = row[4].strip() if len(row) > 4 else ""
+    all_emails = [e.strip() for e in emails_raw.split(",") if e.strip() and e.strip() != "UNKNOWN"]
+    names_raw = row[15].strip() if len(row) > 15 else ""
+    all_names = [n.strip() for n in names_raw.split(",") if n.strip()]
+    client_raw = row[16].strip() if len(row) > 16 else ""
+    client_emails = [c.strip() for c in client_raw.split(",") if c.strip() and "@" in c.strip()]
+    return {
+        "date": row[0].strip() if row[0] else "", "ncr_number": row[1].strip() if len(row) > 1 else "",
+        "description": row[2].strip() if len(row) > 2 else "", "contractor": row[3].strip() if len(row) > 3 else "",
+        "email": all_emails[0] if all_emails else "UNKNOWN", "all_emails": all_emails,
+        "date_raised": row[5].strip() if len(row) > 5 else "", "status": row[6].strip() if len(row) > 6 else "",
+        "last_reminded": row[7].strip() if len(row) > 7 else "",
+        "reminder_count": int(row[8].strip()) if len(row) > 8 and row[8].strip().isdigit() else 0,
+        "thread_id": row[9].strip() if len(row) > 9 else "", "raised_by": row[10].strip() if len(row) > 10 else "",
+        "all_participants": all_participants, "responsible_name": all_names[0] if all_names else "",
+        "all_names": all_names, "client_emails": client_emails
     }
 
 
@@ -1682,9 +2083,51 @@ def process_ncr_email(sender, subject, body, attachments, all_thread_with_names,
     send_email([sender], f"NCR Logged — {extracted.get('ncr_number', 'Unknown')}", notification, html_body=ncr_html, cc_emails=cc, reply_to_msg_id=msg_id_hdr, references=msg_id_hdr)
 
 
+def process_schedule_email(sender, subject, body, attachments, all_thread_with_names, msg_id_hdr):
+    schedule_content = body
+    if attachments:
+        for att in attachments:
+            schedule_content += f"\n\n{att['name']}:\n{att['content']}"
+    extracted = extract_schedule_milestones(schedule_content, all_thread_with_names, subject)
+    programme_ref = extracted.get("programme_reference", subject)
+    milestones = extracted.get("milestones", [])
+    all_participants = [p["email"] for p in all_thread_with_names if p["email"] != ZOHO_EMAIL.lower()]
+    internal, clients, _ = classify_thread_participants(all_thread_with_names)
+    client_emails = [p["email"] for p in clients]
+
+    if not milestones:
+        save_to_monitoring(sender, subject, "Schedule received — no dated milestones extracted", "Review schedule manually", msg_id_hdr, "Monitoring")
+        return
+
+    unknown_count = 0
+    for m in milestones:
+        resp_email = m.get("responsible_email", "UNKNOWN")
+        if resp_email == "UNKNOWN":
+            unknown_count += 1
+        save_schedule_item(
+            programme_ref, m.get("activity", ""), m.get("responsible_party", "Unknown"),
+            resp_email, m.get("responsible_name", ""), m.get("planned_start", ""),
+            msg_id_hdr, sender, all_participants, client_emails, "Pending",
+            responsible_role=m.get("responsible_role", "Contractor")
+        )
+
+    notification = f"Dear {get_first_name(sender)},\n\nI have logged the following work programme in the Schedule Tracker.\n\n"
+    notification += f"Programme reference: {programme_ref}\nMilestones extracted: {len(milestones)}\n\n"
+    for m in milestones[:15]:
+        notification += f"- {m.get('activity','')} — {m.get('responsible_party','Unknown')} — starts {m.get('planned_start','')}\n"
+    if len(milestones) > 15:
+        notification += f"...and {len(milestones) - 15} more.\n"
+    if unknown_count:
+        notification += f"\n{unknown_count} milestone(s) could not be matched to a contractor email. Please reply with the contractor name and email for each so I can track them properly.\n"
+    notification += "\nI will send advance notices to contractors 7 days and 3 days before each milestone's planned start date — exactly two notices per milestone, no more — subject to your team's approval before dispatch. Please reply confirmed if this is correct, or provide corrections.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+
+    cc = list(set([r for r in REPORT_RECIPIENTS if r.lower() != sender.lower()] + client_emails))
+    send_email([sender], f"Work Programme Logged — {programme_ref}", notification, html_body=build_reply_html(notification), cc_emails=cc, reply_to_msg_id=msg_id_hdr, references=msg_id_hdr)
+
+
 def build_mom_confirmation_html(sender, meeting_ref, actions, client_id, contractor_id, internal, clients, contractors, unknown_count):
-    today = datetime.now().strftime("%d %B %Y")
-    time_now = datetime.now().strftime("%H:%M")
+    today = baku_now().strftime("%d %B %Y")
+    time_now = baku_now().strftime("%H:%M")
 
     def fmt_party_card(title, lst, note, empty_note, accent):
         if lst:
@@ -1750,8 +2193,8 @@ def build_mom_confirmation_html(sender, meeting_ref, actions, client_id, contrac
 
 
 def build_ncr_confirmation_html(sender, ncr_data):
-    today = datetime.now().strftime("%d %B %Y")
-    time_now = datetime.now().strftime("%H:%M")
+    today = baku_now().strftime("%d %B %Y")
+    time_now = baku_now().strftime("%H:%M")
     ncr_number = ncr_data.get("ncr_number", "Unknown")
     description = ncr_data.get("description", "")
     contractor = ncr_data.get("contractor", "Unknown")
@@ -1791,8 +2234,8 @@ def build_ncr_confirmation_html(sender, ncr_data):
 
 
 def build_external_reminder_html(body_text, meeting_ref, action_item, responsible_label, due_date, reminder_label="Follow-up", on_behalf_of=None):
-    today = datetime.now().strftime("%d %B %Y")
-    time_now = datetime.now().strftime("%H:%M")
+    today = baku_now().strftime("%d %B %Y")
+    time_now = baku_now().strftime("%H:%M")
     paragraphs = body_text.strip().split("\n\n")
     html_body = ""
     for para in paragraphs:
@@ -1842,8 +2285,8 @@ def build_external_reminder_html(body_text, meeting_ref, action_item, responsibl
 
 
 def build_ncr_reminder_html(body_text, ncr_number, description, contractor_label, date_raised, days_open):
-    today = datetime.now().strftime("%d %B %Y")
-    time_now = datetime.now().strftime("%H:%M")
+    today = baku_now().strftime("%d %B %Y")
+    time_now = baku_now().strftime("%H:%M")
     paragraphs = body_text.strip().split("\n\n")
     html_body = ""
     for para in paragraphs:
@@ -1891,13 +2334,75 @@ def build_ncr_reminder_html(body_text, ncr_number, description, contractor_label
 </div></body></html>"""
 
 
-def build_report_html(pending, closed, today, day_name, time_now, open_actions=None, flagged=None, open_ncrs=None):
+def build_schedule_notice_html(body_text, programme_ref, activity, responsible_label, responsible_role, planned_start, notice_label, days_until):
+    today = baku_now().strftime("%d %B %Y")
+    time_now = baku_now().strftime("%H:%M")
+    paragraphs = body_text.strip().split("\n\n")
+    html_body = ""
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        if "Alex Rivera" in para and "SCOPE Consulting" in para:
+            lines = para.split("\n")
+            sig_html = ""
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                if "Alex Rivera" in line:
+                    sig_html += f'<div style="font-size:13px;font-weight:600;color:#1a2942;">{line}</div>'
+                elif "internal@scope-iq.io" in line:
+                    sig_html += f'<div style="font-size:12px;color:#8B0000;">{line}</div>'
+                else:
+                    sig_html += f'<div style="font-size:12px;color:#666;">{line}</div>'
+            html_body += f'<div style="margin-top:20px;padding-top:16px;border-top:1px solid #f0f0f0;line-height:1.8;">{sig_html}</div>'
+        else:
+            lines = para.split("\n")
+            para_html = "<br>".join(line.strip() for line in lines if line.strip())
+            html_body += f'<p style="font-size:14px;color:#333;line-height:1.8;margin:0 0 16px;">{para_html}</p>'
+
+    urgency_note = "This is the final notice before the planned start date." if days_until <= 3 else "This is an advance notice, sent ahead of the planned start date."
+
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif;">
+<div style="max-width:620px;margin:0 auto;padding:20px 0;">
+  <div style="background:#7a1418;border-radius:12px 12px 0 0;padding:24px 28px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <div style="color:#fff;font-size:22px;font-weight:600;letter-spacing:1px;">SCOPE <span style="color:#f0a8a8;">IQ</span></div>
+      <div style="background:#c00000;color:#fff;font-size:11px;padding:4px 12px;border-radius:20px;font-weight:500;">{notice_label}</div>
+    </div>
+    <table style="width:100%;font-size:12px;border-collapse:collapse;">
+      <tr><td style="color:#e8b8b8;padding:2px 0;width:50%;">Date &nbsp;<strong style="color:#fbdada;">{today}</strong></td><td style="color:#e8b8b8;padding:2px 0;">Time &nbsp;<strong style="color:#fbdada;">{time_now} Baku</strong></td></tr>
+      <tr><td style="color:#e8b8b8;padding:2px 0;">Days until start &nbsp;<strong style="color:#fbdada;">{days_until}</strong></td><td style="color:#e8b8b8;padding:2px 0;">Programme ref &nbsp;<strong style="color:#fbdada;">{programme_ref}</strong></td></tr>
+    </table>
+  </div>
+  <div style="background:#3a1414;padding:16px 28px;"><div style="font-size:11px;color:#e0a8a8;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">Upcoming milestone</div><div style="font-size:14px;color:#fff;font-weight:600;line-height:1.5;">{activity}</div></div>
+  <div style="background:#fff;border:1px solid #e8e8e8;border-top:none;border-radius:0 0 12px 12px;padding:24px 28px;">
+    <div style="border:1px solid #e8e8e8;border-radius:8px;margin-bottom:20px;overflow:hidden;"><div style="background:#f8f9fa;padding:10px 16px;border-bottom:1px solid #e8e8e8;"><span style="font-size:12px;color:#888;font-weight:500;">MILESTONE DETAILS</span></div><div style="padding:14px 16px;"><table style="width:100%;font-size:13px;border-collapse:collapse;"><tr><td style="color:#888;padding:4px 0;width:140px;">Responsible</td><td style="color:#7a1418;font-weight:600;">{responsible_label}</td></tr><tr><td style="color:#888;padding:4px 0;">Role</td><td style="color:#333;">{responsible_role}</td></tr><tr><td style="color:#888;padding:4px 0;">Planned start</td><td style="color:#333;">{planned_start}</td></tr><tr><td style="color:#888;padding:4px 0;">Programme reference</td><td style="color:#333;">{programme_ref}</td></tr></table></div></div>
+    {html_body}
+    <div style="background:#fdf0f0;border:1px solid #f0c0c0;border-radius:6px;padding:10px 14px;margin-top:12px;"><div style="font-size:12px;color:#7a1418;line-height:1.6;">{urgency_note} Per the work programme, exactly two notices are sent per milestone — this is notice-only, no further automatic sends will follow beyond the second.</div></div>
+    <div style="background:#f8f9fa;border-radius:6px;padding:10px 14px;margin-top:16px;"><div style="font-size:11px;color:#888;line-height:1.6;">This notice was prepared by <strong style="color:#1a2942;">Alex Rivera</strong>, using <strong style="color:#7a1418;">SCOPE IQ</strong>.</div></div>
+  </div>
+</div></body></html>"""
+
+
+def tier_days_until(planned_start_str):
+    try:
+        start_date = datetime.strptime(planned_start_str, "%d.%m.%Y").date()
+        return max((start_date - baku_now().date()).days, 0)
+    except:
+        return 0
+
+
+def build_report_html(pending, closed, today, day_name, time_now, open_actions=None, flagged=None, open_ncrs=None, upcoming_milestones=None):
     n_open = len([r for r in pending if r.get("Status") == "Open"])
     n_monitor = len([r for r in pending if r.get("Status") == "Monitoring"])
     n_closed = len(closed)
     open_actions = open_actions or []
     flagged = flagged or []
     open_ncrs = open_ncrs or []
+    upcoming_milestones = upcoming_milestones or []
     total_open = len(pending) + len(open_actions) + len(open_ncrs)
 
     items_html = ""
@@ -1947,8 +2452,18 @@ def build_report_html(pending, closed, today, day_name, time_now, open_actions=N
         ncr_html += '<div style="background:#fff8ee;border:1px solid #f0c060;border-radius:6px;padding:10px 14px;margin-top:8px;"><div style="font-size:11px;color:#5a3a00;">NCRs remain open until a corrective action report is received and accepted.</div></div>'
         ncr_html += "</div>"
 
+    milestone_html = ""
+    if upcoming_milestones:
+        milestone_html += '<div style="margin-top:24px;border-top:2px solid #e8e8e8;padding-top:20px;"><div style="font-size:11px;font-weight:600;color:#888;letter-spacing:1px;text-transform:uppercase;margin-bottom:12px;">Upcoming milestones (next 14 days)</div>'
+        for m in upcoming_milestones[:10]:
+            days = m["Days Until"]
+            urgency_bg = "#fff0f0" if days <= 3 else "#fff8ee"
+            urgency_tx = "#c00000" if days <= 3 else "#9a6000"
+            milestone_html += f'<div style="border:1px solid #e8e8e8;border-radius:8px;margin-bottom:12px;overflow:hidden;"><div style="background:#f8f9fa;padding:10px 14px;display:flex;justify-content:space-between;border-bottom:1px solid #e8e8e8;"><span style="font-size:12px;color:#888;">Starts {m["Planned Start"]}</span><span style="background:{urgency_bg};color:{urgency_tx};font-size:11px;padding:2px 8px;border-radius:20px;">{days} day(s)</span></div><div style="padding:14px;"><div style="font-size:13px;color:#1a2942;font-weight:600;margin-bottom:6px;">{m["Activity"]}</div><div style="font-size:12px;color:#333;">Responsible: {m["Responsible"]}</div></div></div>'
+        milestone_html += "</div>"
+
     no_items = ""
-    if not pending and not open_actions and not open_ncrs:
+    if not pending and not open_actions and not open_ncrs and not upcoming_milestones:
         no_items = '<div style="text-align:center;padding:32px;"><div style="width:48px;height:48px;border-radius:50%;background:#e1f5ee;margin:0 auto 12px;font-size:22px;color:#3CB496;display:flex;align-items:center;justify-content:center;">&#10003;</div><div style="font-size:15px;color:#333;font-weight:500;">All clear</div><div style="font-size:13px;color:#888;margin-top:4px;">No outstanding items as of today.</div></div>'
 
     greeting = f"Good morning. Daily report for <strong>{today}</strong>. <strong>{total_open} open item(s)</strong> require attention." if total_open else f"Good morning. Daily report for <strong>{today}</strong>. All items are clear."
@@ -1979,12 +2494,13 @@ def build_report_html(pending, closed, today, day_name, time_now, open_actions=N
     {items_html}
     {ext_html}
     {ncr_html}
+    {milestone_html}
     {no_items}
     <div style="border-top:1px solid #f0f0f0;margin-top:24px;padding-top:20px;display:flex;justify-content:space-between;">
       <div style="font-size:12px;color:#666;line-height:1.8;"><strong style="color:#1a2942;font-size:13px;">Alex Rivera</strong><br>Construction Expert<br>SCOPE Consulting MMC<br><span style="color:#3CB496;">internal@scope-iq.io</span></div>
       <div style="font-size:11px;color:#aaa;text-align:right;line-height:1.7;">Generated automatically<br>SCOPE IQ<br>09:00 Baku daily</div>
     </div>
-    <div style="background:#f8f9fa;border-radius:6px;padding:10px 14px;margin-top:16px;"><div style="font-size:11px;color:#888;"><strong style="color:#555;">Chase protocol:</strong> Draft at day 3, 7, 14 &nbsp;·&nbsp; Auto-close at day 21 (NCRs remain open until resolved). Reply to this report anytime with an instruction such as send reminder for NCR-0008 to trigger a follow-up on demand.</div></div>
+    <div style="background:#f8f9fa;border-radius:6px;padding:10px 14px;margin-top:16px;"><div style="font-size:11px;color:#888;"><strong style="color:#555;">Chase protocol:</strong> Draft at day 3, 7, 14 &nbsp;·&nbsp; Auto-close at day 21 (NCRs remain open until resolved). Milestone notices: exactly 2 per milestone, 7 days and 3 days before start. Reply to this report anytime with an instruction to trigger a follow-up on demand.</div></div>
   </div>
 </div></body></html>"""
 
@@ -2187,7 +2703,7 @@ def check_external_action_reminders():
         if not sheet:
             return
         all_values = sheet.get_all_values()
-        today = datetime.now()
+        today = baku_now().replace(tzinfo=None)
         for i, row in enumerate(all_values[1:], start=2):
             try:
                 if len(row) < 7:
@@ -2238,7 +2754,7 @@ def check_external_action_reminders():
                     cc = [r for r in REPORT_RECIPIENTS if r.lower() != data["mom_sender"].lower()]
                     sent = send_email([data["mom_sender"]], f"Approval Required — {tone_label} to {resp_label}", approval, html_body=build_reply_html(approval), cc_emails=cc, reply_to_msg_id=data["thread_id"], references=data["thread_id"])
                     if sent:
-                        update_action_row(i, status="Draft Pending", last_reminded=today.strftime("%d.%m.%Y %H:%M"))
+                        update_action_row(i, status="Draft Pending", last_reminded=baku_now().strftime("%d.%m.%Y %H:%M"))
             except Exception as e:
                 logger.error(f"External reminder row error: {e}")
                 continue
@@ -2252,7 +2768,7 @@ def check_ncr_reminders():
         if not sheet:
             return
         all_values = sheet.get_all_values()
-        today = datetime.now()
+        today = baku_now().replace(tzinfo=None)
         for i, row in enumerate(all_values[1:], start=2):
             try:
                 if len(row) < 7:
@@ -2318,12 +2834,100 @@ internal@scope-iq.io"""
                 ncr_reminder_html = build_ncr_reminder_html(approval, data["ncr_number"], data["description"], resp_label, data["date_raised"], days_open)
                 sent = send_email([data["raised_by"]], f"Approval Required — NCR Follow-up to {resp_label}", approval, html_body=ncr_reminder_html, cc_emails=cc, reply_to_msg_id=data["thread_id"], references=data["thread_id"])
                 if sent:
-                    update_ncr_row(i, status="Draft Pending", last_reminded=today.strftime("%d.%m.%Y %H:%M"))
+                    update_ncr_row(i, status="Draft Pending", last_reminded=baku_now().strftime("%d.%m.%Y %H:%M"))
             except Exception as e:
                 logger.error(f"NCR reminder row error: {e}")
                 continue
     except Exception as e:
         logger.error(f"NCR reminder check error: {e}")
+
+
+def check_schedule_milestone_reminders():
+    """
+    Runs every 6 hours. For each Pending/Notice Sent milestone, checks
+    days-until-start (in Baku time) and drafts an advance notice at 7 days
+    out and a final reminder at 3 days out — exactly two notices maximum,
+    both requiring approval before dispatch.
+    """
+    try:
+        sheet = get_schedule_tracker_sheet()
+        if not sheet:
+            return
+        all_values = sheet.get_all_values()
+        today = baku_now().date()
+        for i, row in enumerate(all_values[1:], start=2):
+            try:
+                if len(row) < 8:
+                    continue
+                data = get_schedule_data_from_row(row)
+                if data["status"] not in ["Pending", "Notice Sent"]:
+                    continue
+                if data["email"] in ["UNKNOWN", ""]:
+                    continue
+                try:
+                    start_date = datetime.strptime(data["planned_start"], "%d.%m.%Y").date()
+                except:
+                    continue
+
+                days_until = (start_date - today).days
+
+                if days_until < 0:
+                    update_schedule_row(i, status="Started")
+                    continue
+
+                reminder_count = data["reminder_count"]
+                if reminder_count >= 2:
+                    continue
+
+                tier_due = None
+                if days_until <= 7 and reminder_count == 0:
+                    tier_due = 1
+                elif days_until <= 3 and reminder_count == 1:
+                    tier_due = 2
+
+                if not tier_due:
+                    continue
+
+                if data["last_reminded"]:
+                    try:
+                        last_date = datetime.strptime(data["last_reminded"], "%d.%m.%Y %H:%M")
+                        if (baku_now().replace(tzinfo=None) - last_date).days < 1:
+                            continue
+                    except:
+                        pass
+
+                resp_label = data["responsible_name"] or data["responsible"]
+                role = data.get("responsible_role", "Contractor")
+                tone_label = "Advance Notice" if tier_due == 1 else "Final Reminder"
+                prompt = f"""Draft a {"polite advance" if tier_due == 1 else "firm final"} notice email regarding an upcoming milestone start date per the agreed work programme.
+
+Programme reference: {data['programme_ref']}
+Activity: {data['activity']}
+Responsible: {resp_label}
+Planned start date: {data['planned_start']}
+Days until start: {days_until}
+
+Start with Dear {resp_label if not data['responsible_name'] else data['responsible_name'].split()[0]},
+State clearly this activity is due to start on {data['planned_start']} per the agreed work programme, and request general confirmation of readiness to proceed.
+Write complete formal professional email. No bullet points or symbols.
+End with:
+Alex Rivera
+Construction Expert
+SCOPE Consulting MMC
+internal@scope-iq.io"""
+                response = anthropic_client.messages.create(model=MODEL, max_tokens=700, system=SYSTEM_PROMPT, messages=[{"role": "user", "content": prompt}])
+                draft = response.content[0].text
+
+                approval = f"Dear Team,\n\nThe following milestone is due to start in {days_until} day(s) per the agreed work programme.\n\nProgramme reference: {data['programme_ref']}\nActivity: {data['activity']}\nResponsible: {resp_label} ({data['email']})\nPlanned start: {data['planned_start']}\n\nI have prepared a {tone_label.lower()} for your approval. Note: this is notice {tier_due} of 2 for this milestone — no further automatic notices will follow.\n\n{'='*50}\nDRAFT — {tone_label.upper()} TO {resp_label.upper()}:\n{'='*50}\n\n{draft}\n\n{'='*50}\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+                cc = [r for r in REPORT_RECIPIENTS if r.lower() != data["uploaded_by"].lower()]
+                sent = send_email([data["uploaded_by"]], f"Approval Required — {tone_label} — {data['activity'][:50]}", approval, html_body=build_reply_html(approval), cc_emails=cc, reply_to_msg_id=data["thread_id"], references=data["thread_id"])
+                if sent:
+                    update_schedule_row(i, status="Draft Pending", last_reminded=baku_now().strftime("%d.%m.%Y %H:%M"))
+            except Exception as e:
+                logger.error(f"Schedule milestone row error: {e}")
+                continue
+    except Exception as e:
+        logger.error(f"Schedule milestone check error: {e}")
 
 
 def check_thread_replies(thread_ids):
@@ -2377,7 +2981,7 @@ def check_followup_reminders():
         all_values = sheet.get_all_values()
         if not all_values or len(all_values) < 2:
             return
-        today = datetime.now()
+        today = baku_now().replace(tzinfo=None)
         monitoring_threads = {}
         for i, row in enumerate(all_values[1:], start=2):
             if len(row) >= 6 and row[5].strip() == "Monitoring":
@@ -2449,7 +3053,7 @@ def check_followup_reminders():
                     cc = [r for r in REPORT_RECIPIENTS if r.lower() != sender.lower()]
                 sent = send_email([sender], subject_line, body, cc_emails=cc, html_body=build_reply_html(body))
                 if sent:
-                    update_row(i, last_reminded=today.strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_due)
+                    update_row(i, last_reminded=baku_now().strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_due)
             except Exception as e:
                 logger.error(f"Reminder row error: {e}")
                 continue
@@ -2657,8 +3261,8 @@ Write complete formal professional reply. If files needed and never provided, re
 
 
 def build_reply_html(body_text):
-    today = datetime.now().strftime("%d %B %Y")
-    time_now = datetime.now().strftime("%H:%M")
+    today = baku_now().strftime("%d %B %Y")
+    time_now = baku_now().strftime("%H:%M")
     paragraphs = body_text.strip().split("\n\n")
     html_body = ""
     for para in paragraphs:
@@ -2799,6 +3403,16 @@ def process_emails():
                             if se not in seen and se != ZOHO_EMAIL.lower():
                                 seen.add(se); all_with_names.append({"email": se, "name": ""})
                         process_mom_email(sender, subject, body_raw, attachments, all_with_names, msg_id_hdr)
+                    elif task_type == "SCHEDULE":
+                        all_with_names = []
+                        seen = set()
+                        for p in [from_with_name] + to_with_names + cc_with_names:
+                            if p["email"] and p["email"] not in seen:
+                                seen.add(p["email"]); all_with_names.append(p)
+                        for se in extract_emails_from_text(body_raw):
+                            if se not in seen and se != ZOHO_EMAIL.lower():
+                                seen.add(se); all_with_names.append({"email": se, "name": ""})
+                        process_schedule_email(sender, subject, body_raw, attachments, all_with_names, msg_id_hdr)
                     else:
                         analysis = analyse_email(sender, subject, body_clean, attachments=attachments, memory_files=memory_files, is_cc=True)
                         if analysis:
@@ -2820,16 +3434,37 @@ def process_emails():
                     if not ncr_matches:
                         ncr_matches = find_open_ncrs_by_subject(subject)
 
+                    schedule_matches = find_all_open_schedule_matching_refs(in_reply_to, references)
+
                     if thread_actions:
                         handle_mom_thread_reply(sender, body_clean, thread_actions, msg_id_hdr, in_reply_to, references)
                     elif ncr_matches:
                         handle_ncr_thread_reply(sender, body_clean, ncr_matches, msg_id_hdr, references)
+                    elif schedule_matches:
+                        handle_schedule_thread_reply(sender, body_clean, schedule_matches, msg_id_hdr, references)
                     elif is_short_reply(body_clean):
                         recent_draft_actions = find_all_recent_open_actions_with_drafts()
                         recent_draft_ncrs = find_all_recent_open_ncrs_with_drafts()
                         all_open_ncrs = find_all_recent_open_ncrs()
 
-                        if (recent_draft_actions or recent_draft_ncrs) and is_approval_reply(body_clean) and not is_rejection_reply(body_clean):
+                        if (recent_draft_actions or recent_draft_ncrs) and is_rejection_reply(body_clean):
+                            # Rejection is checked FIRST and independently of approval, so a
+                            # short "no need" reply always closes stale Draft Pending items
+                            # instead of silently falling through to a path that never
+                            # cancels them.
+                            summary = []
+                            for a in recent_draft_actions:
+                                update_action_row(a["row"], status="Closed — No Action Required", notes=f"Closed per instruction from {sender} (short reply)")
+                                summary.append(a['action'][:80])
+                            for n in recent_draft_ncrs:
+                                update_ncr_row(n["row"], status="Closed", notes=f"Closed per instruction from {sender} (short reply)")
+                                summary.append(f"NCR {n['ncr_number']}")
+                            notice = f"Dear {get_first_name(sender)},\n\nPer your instruction, the following item(s) have been closed with no further action:\n\n"
+                            for s in summary:
+                                notice += f"- {s}\n"
+                            notice += "\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+                            send_email([sender], "Re: Closed — No Action Required", notice, html_body=build_reply_html(notice))
+                        elif (recent_draft_actions or recent_draft_ncrs) and is_approval_reply(body_clean):
                             summary = []
                             for a in recent_draft_actions:
                                 dispatch_approved_external_draft(a)
@@ -2845,7 +3480,7 @@ def process_emails():
                         elif all_open_ncrs:
                             handle_ncr_thread_reply(sender, body_clean, all_open_ncrs, msg_id_hdr, references)
                         else:
-                            save_to_monitoring(sender, subject, f"Short reply received but no matching open NCR/MOM/action found: '{body_clean[:100]}'", "Please clarify which item this reply relates to", msg_id_hdr, "Monitoring")
+                            save_to_monitoring(sender, subject, f"Short reply received but no matching open NCR/MOM/action/schedule found: '{body_clean[:100]}'", "Please clarify which item this reply relates to", msg_id_hdr, "Monitoring")
                     elif detect_email_task_type(subject, body_raw, attachments) == "NCR":
                         all_with_names = []
                         seen = set()
@@ -2868,14 +3503,46 @@ def process_emails():
                                 seen.add(se); all_with_names.append({"email": se, "name": ""})
                         process_mom_email(sender, subject, body_raw, attachments, all_with_names, msg_id_hdr)
                         save_to_memory(sender, subject, "MOM processed — see Action Tracker", "Review Action Tracker", "Closed")
+                    elif detect_email_task_type(subject, body_raw, attachments) == "SCHEDULE":
+                        all_with_names = []
+                        seen = set()
+                        for p in [from_with_name] + to_with_names + cc_with_names:
+                            if p["email"] and p["email"] not in seen:
+                                seen.add(p["email"]); all_with_names.append(p)
+                        for se in extract_emails_from_text(body_raw):
+                            if se not in seen and se != ZOHO_EMAIL.lower():
+                                seen.add(se); all_with_names.append({"email": se, "name": ""})
+                        process_schedule_email(sender, subject, body_raw, attachments, all_with_names, msg_id_hdr)
+                        save_to_memory(sender, subject, "Schedule processed — see Schedule Tracker", "Review Schedule Tracker", "Closed")
                     else:
-                        analysis = analyse_email(sender, subject, body_clean, attachments=attachments, memory_files=memory_files, is_cc=False)
-                        if analysis:
-                            reply_sub = f"Re: {subject}" if not subject.startswith("Re:") else subject
-                            all_recipients = list(set([sender] + [a for a in to_addresses if a != ZOHO_EMAIL.lower()] + [a for a in cc_addresses if a != ZOHO_EMAIL.lower()]))
-                            new_references = f"{references} {msg_id_hdr}".strip() if references else msg_id_hdr
-                            sent = send_email(all_recipients, reply_sub, analysis, reply_to_msg_id=msg_id_hdr, references=new_references, html_body=build_reply_html(analysis))
-                            save_to_memory(sender, subject, analysis[:400], "Replied by Alex", "Closed" if sent else "Open")
+                        looks_like_tracked_reply = (
+                            "approval required" in subject.lower()
+                            or "escalation" in subject.lower()
+                            or "follow-up" in subject.lower()
+                            or "reminder" in subject.lower()
+                            or subject.lower().startswith("re:")
+                        )
+                        if looks_like_tracked_reply and is_short_reply(body_clean):
+                            # A reply to a tracked-looking subject that matched nothing
+                            # above (no open Action/NCR/Schedule item) is flagged for
+                            # manual review instead of falling into the generic AI
+                            # analysis fallback, which previously could fabricate an
+                            # unrelated response by pulling in stale file memory from a
+                            # different project for the same sender.
+                            save_to_monitoring(
+                                sender, subject,
+                                f"Reply to a tracked-looking subject could not be matched to any open Action/NCR/Schedule item. Reply text: '{body_clean[:150]}'",
+                                "Manual review required — check if this reply belongs to a closed/renamed/deleted item, and action manually if needed.",
+                                msg_id_hdr, "Monitoring"
+                            )
+                        else:
+                            analysis = analyse_email(sender, subject, body_clean, attachments=attachments, memory_files=memory_files, is_cc=False)
+                            if analysis:
+                                reply_sub = f"Re: {subject}" if not subject.startswith("Re:") else subject
+                                all_recipients = list(set([sender] + [a for a in to_addresses if a != ZOHO_EMAIL.lower()] + [a for a in cc_addresses if a != ZOHO_EMAIL.lower()]))
+                                new_references = f"{references} {msg_id_hdr}".strip() if references else msg_id_hdr
+                                sent = send_email(all_recipients, reply_sub, analysis, reply_to_msg_id=msg_id_hdr, references=new_references, html_body=build_reply_html(analysis))
+                                save_to_memory(sender, subject, analysis[:400], "Replied by Alex", "Closed" if sent else "Open")
 
                 elif is_direct and is_external:
                     matched_action = find_action_by_thread(in_reply_to, references)
@@ -2904,12 +3571,13 @@ def send_morning_report():
         pending, closed = read_memory_for_report()
         open_actions, _, flagged = read_actions_for_report()
         open_ncrs, _ = read_ncrs_for_report()
-        today = datetime.now().strftime("%d %B %Y")
-        day_name = datetime.now().strftime("%A")
-        time_now = datetime.now().strftime("%H:%M")
-        html_body = build_report_html(pending, closed, today, day_name, time_now, open_actions=open_actions, flagged=flagged, open_ncrs=open_ncrs)
+        upcoming_milestones = read_schedule_for_report()
+        today = baku_now().strftime("%d %B %Y")
+        day_name = baku_now().strftime("%A")
+        time_now = baku_now().strftime("%H:%M")
+        html_body = build_report_html(pending, closed, today, day_name, time_now, open_actions=open_actions, flagged=flagged, open_ncrs=open_ncrs, upcoming_milestones=upcoming_milestones)
         total_open = len(pending) + len(open_actions) + len(open_ncrs)
-        plain = f"SCOPE IQ Daily Report — {today}\nInternal: {len(pending)} | External: {len(open_actions)} | Open NCRs: {len(open_ncrs)}\nAlex Rivera | SCOPE Consulting MMC"
+        plain = f"SCOPE IQ Daily Report — {today}\nInternal: {len(pending)} | External: {len(open_actions)} | Open NCRs: {len(open_ncrs)} | Upcoming milestones: {len(upcoming_milestones)}\nAlex Rivera | SCOPE Consulting MMC"
         subject_line = f"SCOPE IQ Daily Report — {today}" + (f" — {total_open} Open Item(s)" if total_open else " — All Clear")
         send_email(REPORT_RECIPIENTS, subject_line, plain, html_body=html_body)
     except Exception as e:
@@ -2928,6 +3596,7 @@ def main():
     schedule.every(6).hours.do(check_external_action_reminders)
     schedule.every(6).hours.do(check_mom_confirmation_and_rejections)
     schedule.every(6).hours.do(check_ncr_reminders)
+    schedule.every(6).hours.do(check_schedule_milestone_reminders)
 
     process_emails()
 
