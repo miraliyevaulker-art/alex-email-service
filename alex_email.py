@@ -497,6 +497,41 @@ def save_schedule_item(programme_ref, activity, responsible_party, responsible_e
         logger.error(f"Save schedule item error: {e}")
 
 
+def save_schedule_items_bulk(programme_ref, milestones, thread_id, uploaded_by, all_participants, client_emails):
+    """
+    Saves every milestone from a single work programme in ONE batched
+    append_rows call, instead of one append_row (and one full spreadsheet
+    re-open) per milestone. The previous per-item loop issued a separate
+    network round trip for every milestone, which could hit Google Sheets'
+    write-quota partway through a large programme (e.g. silently stopping
+    after ~15 rows), losing every milestone after that point without any
+    visible error. Returns the count of milestones actually saved.
+    """
+    try:
+        sheet = get_schedule_tracker_sheet()
+        if not sheet:
+            return 0
+        headers = sheet.row_values(1)
+        if len(headers) < 15:
+            sheet.update_cell(1, 15, "Responsible Role")
+        now_str = baku_now().strftime("%d.%m.%Y %H:%M")
+        rows = []
+        for m in milestones:
+            resp_email = m.get("responsible_email", "UNKNOWN")
+            rows.append([
+                now_str, programme_ref, m.get("activity", ""), m.get("responsible_party", "Unknown"),
+                resp_email, m.get("responsible_name", ""), m.get("planned_start", ""), "Pending",
+                "", "0", thread_id, uploaded_by, ",".join(all_participants), ",".join(client_emails),
+                m.get("responsible_role", "Contractor")
+            ])
+        if rows:
+            sheet.append_rows(rows, value_input_option="USER_ENTERED")
+        return len(rows)
+    except Exception as e:
+        logger.error(f"Bulk save schedule items error: {e}")
+        return 0
+
+
 def update_schedule_row(row_number, status=None, last_reminded=None, reminder_count=None):
     try:
         sheet = get_schedule_tracker_sheet()
@@ -1239,7 +1274,7 @@ External parties in this email thread (match responsible party to these where po
 {fmt_list(external_participants)}
 
 Schedule content:
-{schedule_content[:16000]}
+{schedule_content[:24000]}
 
 For each milestone or major activity with a clear planned start date, extract:
 1. Activity/milestone description (concise, e.g. "MEP first fix — Level 3")
@@ -1254,7 +1289,7 @@ Only extract items with a genuine, specific start date — skip vague date range
 Respond in this exact JSON only:
 {{"programme_reference": "...", "milestones": [{{"activity": "...", "responsible_party": "...", "responsible_email": "...", "responsible_name": "...", "planned_start": "DD.MM.YYYY", "responsible_role": "..."}}]}}"""
 
-        response = anthropic_client.messages.create(model=MODEL, max_tokens=3000, messages=[{"role": "user", "content": prompt}])
+        response = anthropic_client.messages.create(model=MODEL, max_tokens=6000, messages=[{"role": "user", "content": prompt}])
         text = response.content[0].text.strip()
         if "```" in text:
             text = text.split("```")[1]
@@ -1368,7 +1403,7 @@ The reply may list contacts against activities, trades, disciplines, or work are
 
 Respond in this exact JSON only:
 {{"vendor_assignments": [{{"row": <row number as integer>, "name": "...", "email": "..."}}], "client_contacts": [{{"name": "...", "email": "..."}}]}}"""
-        response = anthropic_client.messages.create(model=MODEL, max_tokens=2000, messages=[{"role": "user", "content": prompt}])
+        response = anthropic_client.messages.create(model=MODEL, max_tokens=4000, messages=[{"role": "user", "content": prompt}])
         text = response.content[0].text.strip()
         if "```" in text:
             text = text.split("```")[1]
@@ -1507,18 +1542,19 @@ def apply_ncr_clarification(ncr_row_number, new_contacts, existing_emails, exist
 
 def apply_schedule_assignments(assignments):
     """
-    Applies row-identified contact assignments directly — no fuzzy text
-    matching. Supports one contact being applied to many rows in a single
-    bulk reply, since extract_schedule_clarification can return multiple
-    assignments sharing the same email/name across different rows.
+    Applies row-identified contact assignments in a SINGLE batch_update
+    call rather than one (or two) update_cell API calls per row. For a
+    large bulk reply covering many milestones, the previous per-cell-call
+    approach could hit Google Sheets' write-quota partway through and
+    silently stop applying assignments beyond that point.
     """
     updated = []
-    activity_by_row = {}
     try:
         sheet = get_schedule_tracker_sheet()
         if not sheet:
             return updated
         all_rows = sheet.get_all_values()
+        batch_data = []
         for a in assignments:
             row = a.get("row")
             email_ = (a.get("email") or "").strip()
@@ -1532,10 +1568,12 @@ def apply_schedule_assignments(assignments):
             if row_idx < 2 or row_idx > len(all_rows):
                 continue
             activity_label = all_rows[row_idx - 1][2].strip() if len(all_rows[row_idx - 1]) > 2 else f"row {row_idx}"
-            sheet.update_cell(row_idx, 5, email_)
+            batch_data.append({"range": f"E{row_idx}", "values": [[email_]]})
             if name:
-                sheet.update_cell(row_idx, 6, name)
+                batch_data.append({"range": f"F{row_idx}", "values": [[name]]})
             updated.append(f"'{activity_label[:60]}' — responsible: {name or email_} <{email_}>")
+        if batch_data:
+            sheet.batch_update(batch_data, value_input_option="USER_ENTERED")
     except Exception as e:
         logger.error(f"Apply schedule assignments error: {e}")
     return updated
@@ -1564,6 +1602,7 @@ def append_schedule_client_contacts(schedule_matches, client_contacts):
         sheet = get_schedule_tracker_sheet()
         if not sheet:
             return added
+        batch_data = []
         for m in schedule_matches:
             row_idx = m["row"]
             existing = m.get("client_emails", [])
@@ -1574,7 +1613,9 @@ def append_schedule_client_contacts(schedule_matches, client_contacts):
                     merged.append(e)
                     existing_lower.append(e.lower())
             if len(merged) != len(existing):
-                sheet.update_cell(row_idx, 14, ",".join(merged))
+                batch_data.append({"range": f"N{row_idx}", "values": [[",".join(merged)]]})
+        if batch_data:
+            sheet.batch_update(batch_data, value_input_option="USER_ENTERED")
         for e, n in new_emails:
             added.append(f"{n} <{e}>" if n else e)
     except Exception as ex:
@@ -2215,20 +2256,13 @@ def process_schedule_email(sender, subject, body, attachments, all_thread_with_n
         save_to_monitoring(sender, subject, "Schedule received — no dated milestones extracted", "Review schedule manually", msg_id_hdr, "Monitoring")
         return
 
-    unknown_count = 0
-    for m in milestones:
-        resp_email = m.get("responsible_email", "UNKNOWN")
-        if resp_email == "UNKNOWN":
-            unknown_count += 1
-        save_schedule_item(
-            programme_ref, m.get("activity", ""), m.get("responsible_party", "Unknown"),
-            resp_email, m.get("responsible_name", ""), m.get("planned_start", ""),
-            msg_id_hdr, sender, all_participants, client_emails, "Pending",
-            responsible_role=m.get("responsible_role", "Contractor")
-        )
+    unknown_count = sum(1 for m in milestones if m.get("responsible_email", "UNKNOWN") == "UNKNOWN")
+    saved_count = save_schedule_items_bulk(programme_ref, milestones, msg_id_hdr, sender, all_participants, client_emails)
 
     notification = f"Dear {get_first_name(sender)},\n\nI have reviewed the referenced work programme and logged the following milestones in the Schedule Tracker.\n\n"
-    notification += f"Programme reference: {programme_ref}\nMilestones extracted: {len(milestones)}\n\n"
+    notification += f"Programme reference: {programme_ref}\nMilestones extracted: {len(milestones)}\nMilestones logged: {saved_count}\n\n"
+    if saved_count < len(milestones):
+        notification += f"Note: {len(milestones) - saved_count} milestone(s) could not be saved due to a data write issue. Please advise and I will re-attempt logging these separately.\n\n"
     for m in milestones[:15]:
         notification += f"- {m.get('activity','')} — {m.get('responsible_party','Unknown')} — commencing {m.get('planned_start','')}\n"
     if len(milestones) > 15:
