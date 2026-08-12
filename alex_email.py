@@ -554,6 +554,47 @@ def find_all_open_schedule_matching_refs(in_reply_to, references):
         return []
 
 
+def find_open_schedule_by_subject(subject):
+    """
+    Fallback matcher for when thread headers fail to link a reply to its
+    original schedule upload — mirrors find_open_actions_by_subject /
+    find_open_ncrs_by_subject. Without this, a reply whose threading is
+    even slightly off would be silently missed entirely for schedule
+    purposes, which looked like Alex "asking the same thing again" because
+    the reply was never actually applied.
+    """
+    if not subject:
+        return []
+    clean_subject = subject.lower()
+    for prefix in ["re:", "fwd:", "fw:"]:
+        clean_subject = clean_subject.replace(prefix, "")
+    clean_subject = clean_subject.strip()
+    if not clean_subject:
+        return []
+    try:
+        sheet = get_schedule_tracker_sheet()
+        if not sheet:
+            return []
+        matches = []
+        for i, row in enumerate(sheet.get_all_values()[1:], start=2):
+            if len(row) < 8:
+                continue
+            programme_ref = row[1].strip() if len(row) > 1 else ""
+            status = row[7].strip() if len(row) > 7 else ""
+            thread_id = row[10].strip() if len(row) > 10 else ""
+            if not programme_ref or not thread_id or status in ["Started", "Cancelled"]:
+                continue
+            ref_low = programme_ref.lower()
+            if len(ref_low) < 6:
+                continue
+            if ref_low == clean_subject or ref_low in clean_subject or clean_subject in ref_low:
+                matches.append({"row": i, **get_schedule_data_from_row(row)})
+        return matches
+    except Exception as e:
+        logger.error(f"Schedule subject fallback error: {e}")
+        return []
+
+
 def read_memory_for_report():
     try:
         sheet = get_sheet("Sheet1")
@@ -1297,30 +1338,48 @@ Respond in this exact JSON only:
         return []
 
 
-def extract_schedule_clarification(reply_body, schedule_summary):
+def extract_schedule_clarification(reply_body, unmatched_milestones):
+    """
+    Uses explicit ROW identifiers (like the Daily Report reply parser) instead
+    of fuzzy text-hint matching, so a single bulk reply listing many
+    contacts against many milestones/activities/trades is absorbed in one
+    pass. Also classifies each contact as CLIENT or VENDOR: client contacts
+    are never assigned as the responsible party for a milestone — they are
+    tracked separately for CC-only visibility on future notices, since the
+    client did not agree to start the activity and should never receive an
+    external notice framed as an instruction to them.
+    """
     try:
-        prompt = f"""An internal team member replied to a work programme confirmation with contractor contact clarifications.
+        def fmt(lst):
+            return "\n".join([f"  - ROW:{m['row']} | {m['activity']}" for m in lst]) or "  None"
 
-Current milestone(s):
-{schedule_summary}
+        prompt = f"""An internal team member replied to a work programme confirmation with a list of contacts — this may include both the client and vendor/contractor contacts together.
+
+Unmatched milestones needing a responsible vendor/contractor contact (use these ROW numbers to identify each):
+{fmt(unmatched_milestones)}
 
 Reply received:
-{reply_body[:3000]}
+{reply_body[:5000]}
 
-Extract every contractor/responsible party contact name and email mentioned — only external contacts, never internal SCOPE addresses. Also extract which activity each contact belongs to if identifiable.
+The reply may list contacts against activities, trades, disciplines, or work areas, in any format (table, list, prose), and may include the client alongside vendors/contractors. For every contact:
+1. Classify its role as exactly "CLIENT" or "VENDOR" — the client is the party who owns/commissions the project (e.g. the bank, developer, or employer named in the programme), never the party physically executing an activity. Everyone else responsible for delivering a milestone is VENDOR.
+2. For VENDOR contacts only: match each to every milestone ROW it reasonably applies to — a single vendor may apply to several milestones (e.g. one contractor covering multiple related activities). Use your best judgment based on trade, scope, and activity wording even if exact phrasing differs.
+3. For CLIENT contacts: do not assign to any row — list them separately, they will be added for CC visibility only.
 
 Respond in this exact JSON only:
-{{"contacts": [{{"activity_hint": "...", "name": "...", "email": "..."}}]}}"""
-        response = anthropic_client.messages.create(model=MODEL, max_tokens=500, messages=[{"role": "user", "content": prompt}])
+{{"vendor_assignments": [{{"row": <row number as integer>, "name": "...", "email": "..."}}], "client_contacts": [{{"name": "...", "email": "..."}}]}}"""
+        response = anthropic_client.messages.create(model=MODEL, max_tokens=2000, messages=[{"role": "user", "content": prompt}])
         text = response.content[0].text.strip()
         if "```" in text:
             text = text.split("```")[1]
             if text.startswith("json"): text = text[4:]
         data = json.loads(text.strip())
-        return [c for c in data.get("contacts", []) if c.get("email") and not is_internal_email(c["email"])]
+        vendor_assignments = [a for a in data.get("vendor_assignments", []) if a.get("row") and a.get("email") and "@" in a.get("email", "") and not is_internal_email(a["email"])]
+        client_contacts = [c for c in data.get("client_contacts", []) if c.get("email") and "@" in c.get("email", "") and not is_internal_email(c["email"])]
+        return vendor_assignments, client_contacts
     except Exception as e:
         logger.error(f"Schedule clarification parse error: {e}")
-        return []
+        return [], []
 
 
 def extract_daily_report_requests(body, open_actions, open_ncrs):
@@ -1446,36 +1505,81 @@ def apply_ncr_clarification(ncr_row_number, new_contacts, existing_emails, exist
     return added
 
 
-def apply_schedule_clarifications(schedule_matches, clarifications):
+def apply_schedule_assignments(assignments):
+    """
+    Applies row-identified contact assignments directly — no fuzzy text
+    matching. Supports one contact being applied to many rows in a single
+    bulk reply, since extract_schedule_clarification can return multiple
+    assignments sharing the same email/name across different rows.
+    """
     updated = []
-    matched_row_ids = set()
-    for c in clarifications:
-        name = (c.get("name") or "").strip()
-        email_ = (c.get("email") or "").strip()
-        hint = (c.get("activity_hint") or "").strip().lower()
-        if not email_ or "@" not in email_:
-            continue
-        unknown_matches = [m for m in schedule_matches if m["email"] in ["UNKNOWN", ""] and m["row"] not in matched_row_ids]
-        target = None
-        if hint:
-            for m in unknown_matches:
-                if hint in m["activity"].lower() or m["activity"].lower() in hint:
-                    target = m
-                    break
-        if not target and len(unknown_matches) == 1:
-            target = unknown_matches[0]
-        if target:
+    activity_by_row = {}
+    try:
+        sheet = get_schedule_tracker_sheet()
+        if not sheet:
+            return updated
+        all_rows = sheet.get_all_values()
+        for a in assignments:
+            row = a.get("row")
+            email_ = (a.get("email") or "").strip()
+            name = (a.get("name") or "").strip()
+            if not row or not email_ or "@" not in email_:
+                continue
             try:
-                sheet = get_schedule_tracker_sheet()
-                if sheet:
-                    sheet.update_cell(target["row"], 5, email_)
-                    if name:
-                        sheet.update_cell(target["row"], 6, name)
-                matched_row_ids.add(target["row"])
-                updated.append(f"'{target['activity'][:60]}' — responsible: {name or email_} <{email_}>")
-            except Exception as e:
-                logger.error(f"Apply schedule clarification error: {e}")
+                row_idx = int(row)
+            except:
+                continue
+            if row_idx < 2 or row_idx > len(all_rows):
+                continue
+            activity_label = all_rows[row_idx - 1][2].strip() if len(all_rows[row_idx - 1]) > 2 else f"row {row_idx}"
+            sheet.update_cell(row_idx, 5, email_)
+            if name:
+                sheet.update_cell(row_idx, 6, name)
+            updated.append(f"'{activity_label[:60]}' — responsible: {name or email_} <{email_}>")
+    except Exception as e:
+        logger.error(f"Apply schedule assignments error: {e}")
     return updated
+
+
+def append_schedule_client_contacts(schedule_matches, client_contacts):
+    """
+    Adds client contacts to the Client Emails column (CC-only visibility)
+    across every milestone row belonging to this programme upload. Client
+    contacts are never written to the Responsible Email column — they did
+    not agree to execute the activity and must never receive a notice
+    framed as an instruction directed at them.
+    """
+    added = []
+    if not client_contacts or not schedule_matches:
+        return added
+    new_emails = []
+    for c in client_contacts:
+        e = (c.get("email") or "").strip()
+        n = (c.get("name") or "").strip()
+        if e and "@" in e:
+            new_emails.append((e, n))
+    if not new_emails:
+        return added
+    try:
+        sheet = get_schedule_tracker_sheet()
+        if not sheet:
+            return added
+        for m in schedule_matches:
+            row_idx = m["row"]
+            existing = m.get("client_emails", [])
+            existing_lower = [x.lower() for x in existing]
+            merged = list(existing)
+            for e, n in new_emails:
+                if e.lower() not in existing_lower:
+                    merged.append(e)
+                    existing_lower.append(e.lower())
+            if len(merged) != len(existing):
+                sheet.update_cell(row_idx, 14, ",".join(merged))
+        for e, n in new_emails:
+            added.append(f"{n} <{e}>" if n else e)
+    except Exception as ex:
+        logger.error(f"Append schedule client contacts error: {ex}")
+    return added
 
 
 def dispatch_approved_external_draft(action_data):
@@ -1767,35 +1871,47 @@ def handle_schedule_thread_reply(sender, body, schedule_matches, msg_id_hdr, ref
         if draft_pending:
             for s in draft_pending:
                 dispatch_approved_schedule_draft(s)
-            notice = f"Dear {get_first_name(sender)},\n\nThank you for confirming. The following milestone notice(s) have been sent:\n\n"
+            notice = f"Dear {get_first_name(sender)},\n\nThank you for your confirmation. The following milestone notice(s) have accordingly been issued to the responsible parties:\n\n"
             for s in draft_pending:
                 notice += f"- {s['activity'][:80]}\n"
             notice += "\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
             send_email([sender], f"Sent — {programme_ref}", notice, html_body=build_reply_html(notice), cc_emails=cc, reply_to_msg_id=msg_id_hdr, references=new_refs)
             return True
 
-    schedule_summary = "\n".join([f"- {s['activity']} | Responsible: {s['responsible']} | Current contact: {s['email'] if s['email'] != 'UNKNOWN' else 'None'}" for s in schedule_matches])
-    new_contacts = extract_schedule_clarification(body, schedule_summary)
+    unmatched = [s for s in schedule_matches if s["email"] in ["UNKNOWN", ""]]
 
-    if new_contacts:
-        updated = apply_schedule_clarifications(schedule_matches, new_contacts)
-        notice = f"Dear {get_first_name(sender)},\n\nThank you for the clarification.\n\n"
-        if updated:
-            notice += "I have updated the Schedule Tracker as follows:\n\n"
-            for s in updated:
-                notice += f"- {s}\n"
-        else:
-            notice += "I have noted the information provided.\n\n"
-        notice += "\nAdvance notices will be sent 7 days and 3 days before each milestone's planned start date, subject to your approval.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
-        send_email([sender], f"Schedule Contacts Updated — {programme_ref}", notice, html_body=build_reply_html(notice), cc_emails=cc, reply_to_msg_id=msg_id_hdr, references=new_refs)
-        return True
+    if unmatched:
+        vendor_assignments, client_contacts = extract_schedule_clarification(body, unmatched)
+        if vendor_assignments or client_contacts:
+            updated = apply_schedule_assignments(vendor_assignments) if vendor_assignments else []
+            client_added = append_schedule_client_contacts(schedule_matches, client_contacts) if client_contacts else []
+            remaining_unmatched = len(unmatched) - len(updated)
+
+            notice = f"Dear {get_first_name(sender)},\n\nThank you for providing the contact details for the referenced work programme. I have reviewed and applied the following updates to the Schedule Tracker.\n\n"
+            if updated:
+                notice += f"Responsible party assigned for {len(updated)} milestone(s):\n\n"
+                for s in updated:
+                    notice += f"- {s}\n"
+                notice += "\n"
+            if client_added:
+                notice += "Client contact(s) recorded for CC visibility on all future correspondence relating to this programme:\n\n"
+                for c in client_added:
+                    notice += f"- {c}\n"
+                notice += "\n"
+            if not updated and not client_added:
+                notice += "I was unable to confidently apply the information provided to a specific milestone.\n\n"
+            if remaining_unmatched > 0:
+                notice += f"{remaining_unmatched} milestone(s) still require a responsible contact. Should you be able to provide the outstanding contractor or vendor details, I will apply them accordingly.\n\n"
+            notice += "Advance notices will continue to be issued seven days and three days ahead of each milestone's planned start date, subject to your prior approval.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+            send_email([sender], f"Schedule Contacts Updated — {programme_ref}", notice, html_body=build_reply_html(notice), cc_emails=cc, reply_to_msg_id=msg_id_hdr, references=new_refs)
+            return True
 
     if is_approval_reply(body):
-        notice = f"Dear {get_first_name(sender)},\n\nThank you for confirming. The work programme has been logged and milestones will be tracked accordingly.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+        notice = f"Dear {get_first_name(sender)},\n\nThank you for your confirmation. The work programme has been logged accordingly, and the associated milestones will be tracked per the agreed schedule.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
         send_email([sender], f"Confirmed — {programme_ref}", notice, html_body=build_reply_html(notice), cc_emails=cc, reply_to_msg_id=msg_id_hdr, references=new_refs)
         return True
 
-    notice = f"Dear {get_first_name(sender)},\n\nThank you for your reply regarding {programme_ref}. I was unable to identify a specific contractor contact or clear instruction in this message. If you are providing a contact, please state the activity, name, and email address explicitly.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+    notice = f"Dear {get_first_name(sender)},\n\nThank you for your reply regarding {programme_ref}. I was unable to identify a specific contractor contact or clear instruction within this message. Should you wish to provide a contact, kindly state the relevant activity together with the contact's name and email address.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
     send_email([sender], f"Re: {programme_ref}", notice, html_body=build_reply_html(notice), cc_emails=cc, reply_to_msg_id=msg_id_hdr, references=new_refs)
     return True
 
@@ -2111,15 +2227,15 @@ def process_schedule_email(sender, subject, body, attachments, all_thread_with_n
             responsible_role=m.get("responsible_role", "Contractor")
         )
 
-    notification = f"Dear {get_first_name(sender)},\n\nI have logged the following work programme in the Schedule Tracker.\n\n"
+    notification = f"Dear {get_first_name(sender)},\n\nI have reviewed the referenced work programme and logged the following milestones in the Schedule Tracker.\n\n"
     notification += f"Programme reference: {programme_ref}\nMilestones extracted: {len(milestones)}\n\n"
     for m in milestones[:15]:
-        notification += f"- {m.get('activity','')} — {m.get('responsible_party','Unknown')} — starts {m.get('planned_start','')}\n"
+        notification += f"- {m.get('activity','')} — {m.get('responsible_party','Unknown')} — commencing {m.get('planned_start','')}\n"
     if len(milestones) > 15:
-        notification += f"...and {len(milestones) - 15} more.\n"
+        notification += f"...and {len(milestones) - 15} further milestone(s).\n"
     if unknown_count:
-        notification += f"\n{unknown_count} milestone(s) could not be matched to a contractor email. Please reply with the contractor name and email for each so I can track them properly.\n"
-    notification += "\nI will send advance notices to contractors 7 days and 3 days before each milestone's planned start date — exactly two notices per milestone, no more — subject to your team's approval before dispatch. Please reply confirmed if this is correct, or provide corrections.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+        notification += f"\n{unknown_count} milestone(s) could not be confidently matched to a responsible contact. Should you provide the relevant contractor or vendor details, I will apply them across all corresponding milestones accordingly.\n"
+    notification += "\nAdvance notices will be issued to the responsible party seven days and three days ahead of each milestone's planned start date — two notices per milestone only — each subject to your prior approval before dispatch. Kindly confirm if the above is correct, or advise of any corrections required.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
 
     cc = list(set([r for r in REPORT_RECIPIENTS if r.lower() != sender.lower()] + client_emails))
     send_email([sender], f"Work Programme Logged — {programme_ref}", notification, html_body=build_reply_html(notification), cc_emails=cc, reply_to_msg_id=msg_id_hdr, references=msg_id_hdr)
@@ -3435,6 +3551,8 @@ def process_emails():
                         ncr_matches = find_open_ncrs_by_subject(subject)
 
                     schedule_matches = find_all_open_schedule_matching_refs(in_reply_to, references)
+                    if not schedule_matches:
+                        schedule_matches = find_open_schedule_by_subject(subject)
 
                     if thread_actions:
                         handle_mom_thread_reply(sender, body_clean, thread_actions, msg_id_hdr, in_reply_to, references)
