@@ -813,6 +813,28 @@ def is_ncr_email(subject, body, attachments):
     return False
 
 
+def is_schedule_email(subject, body, attachments):
+    """
+    Body/attachment fallback for schedule detection — mirrors is_mom_email
+    and is_ncr_email. Without this, any work programme email whose subject
+    line didn't literally contain a schedule keyword had NO fallback path
+    at all (unlike MOM/NCR), and would fall straight through to the
+    generic internal-analysis prompt, which reads like Alex performing a
+    cost/quantity assessment instead of logging milestones.
+    """
+    kws = ["schedule", "work programme", "work program", "programme", "baseline programme",
+           "construction programme", "project schedule", "master schedule", "gantt",
+           "look-ahead", "lookahead", "critical path", "milestone"]
+    text = (subject + " " + body).lower()
+    if any(kw in text for kw in kws):
+        return True
+    for att in attachments:
+        name_low = att.get("name", "").lower()
+        if any(kw in name_low for kw in ["schedule", "programme", "program", "gantt", "wbs", "timeline", "p6"]):
+            return True
+    return False
+
+
 def is_mom_subject(subject):
     kws = ["mom", "minutes of meeting", "meeting minutes", "action items", "action points",
            "minutes from", "meeting summary", "iclasın protokolu", "görüş protokolu"]
@@ -836,10 +858,13 @@ def is_schedule_subject(subject):
 
 def detect_email_task_type(subject, body, attachments):
     """
-    Subject line is the single source of truth for routing between MOM,
-    NCR, and SCHEDULE workflows. Body/attachment content is only used as a
-    fallback when the subject itself gives no signal for MOM/NCR — never to
-    override a clear subject. Returns 'MOM', 'NCR', 'SCHEDULE', or None.
+    Subject line is checked first for all three workflows. If the subject
+    gives no clear signal (or is ambiguous across more than one type),
+    body/attachment content is checked next as a fallback — this now
+    covers SCHEDULE as well as MOM/NCR, closing a gap where a work
+    programme email without an obviously-worded subject had no fallback
+    path at all and was silently misrouted to generic analysis.
+    Returns 'MOM', 'NCR', 'SCHEDULE', or None.
     """
     mom_subj = is_mom_subject(subject)
     ncr_subj = is_ncr_subject(subject)
@@ -855,10 +880,12 @@ def detect_email_task_type(subject, body, attachments):
 
     mom_body = is_mom_email(subject, body, attachments)
     ncr_body = is_ncr_email(subject, body, attachments)
-    if mom_body and not ncr_body:
-        return "MOM"
-    if ncr_body and not mom_body:
-        return "NCR"
+    sched_body = is_schedule_email(subject, body, attachments)
+    body_hits = sum([mom_body, ncr_body, sched_body])
+    if body_hits == 1:
+        if mom_body: return "MOM"
+        if ncr_body: return "NCR"
+        if sched_body: return "SCHEDULE"
     return None
 
 
