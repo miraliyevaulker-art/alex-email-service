@@ -601,6 +601,23 @@ def find_all_open_schedule_matching_refs(in_reply_to, references):
         return []
 
 
+def normalize_subject_for_match(subject):
+    """
+    Strips reply/forward prefixes, decorative punctuation (dashes, colons),
+    and collapses whitespace, so minor formatting differences introduced by
+    different mail clients (extra dashes, curly vs straight quotes, double
+    spacing) don't cause a genuine reply to fail subject-based matching.
+    """
+    if not subject:
+        return ""
+    s = subject.lower()
+    for prefix in ["re:", "fwd:", "fw:", "aw:", "sv:", "wg:"]:
+        s = s.replace(prefix, " ")
+    s = re.sub(r'[—–\-:|]', ' ', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+
 def find_open_schedule_by_subject(subject):
     """
     Fallback matcher for when thread headers fail to link a reply to its
@@ -610,12 +627,7 @@ def find_open_schedule_by_subject(subject):
     purposes, which looked like Alex "asking the same thing again" because
     the reply was never actually applied.
     """
-    if not subject:
-        return []
-    clean_subject = subject.lower()
-    for prefix in ["re:", "fwd:", "fw:"]:
-        clean_subject = clean_subject.replace(prefix, "")
-    clean_subject = clean_subject.strip()
+    clean_subject = normalize_subject_for_match(subject)
     if not clean_subject:
         return []
     try:
@@ -631,7 +643,7 @@ def find_open_schedule_by_subject(subject):
             thread_id = row[10].strip() if len(row) > 10 else ""
             if not programme_ref or not thread_id or status in ["Started", "Cancelled"]:
                 continue
-            ref_low = programme_ref.lower()
+            ref_low = normalize_subject_for_match(programme_ref)
             if len(ref_low) < 6:
                 continue
             if ref_low == clean_subject or ref_low in clean_subject or clean_subject in ref_low:
@@ -872,15 +884,22 @@ def detect_email_task_type(subject, body, attachments):
     """
     Subject line is checked first for all three workflows. If the subject
     gives no clear signal (or is ambiguous across more than one type),
-    body/attachment content is checked next as a fallback — this now
-    covers SCHEDULE as well as MOM/NCR, closing a gap where a work
-    programme email without an obviously-worded subject had no fallback
-    path at all and was silently misrouted to generic analysis.
+    body/attachment content is checked next as a fallback.
+
+    SCHEDULE classification additionally REQUIRES an actual attachment,
+    regardless of subject/body keyword matches. A plain confirmation or
+    contact-list reply never carries a document, but its subject or quoted
+    body text will very often contain words like "schedule" or "programme"
+    (since that is exactly the wording Alex's own confirmation email uses)
+    — without this guard, a reply whose thread/subject match to the
+    original tracker entry happens to fail could be silently reprocessed
+    as a brand-new schedule submission, duplicating and re-extracting the
+    same document with a different (non-deterministic) result.
     Returns 'MOM', 'NCR', 'SCHEDULE', or None.
     """
     mom_subj = is_mom_subject(subject)
     ncr_subj = is_ncr_subject(subject)
-    sched_subj = is_schedule_subject(subject)
+    sched_subj = is_schedule_subject(subject) and bool(attachments)
 
     subj_hits = sum([mom_subj, ncr_subj, sched_subj])
     if subj_hits == 1:
@@ -892,7 +911,7 @@ def detect_email_task_type(subject, body, attachments):
 
     mom_body = is_mom_email(subject, body, attachments)
     ncr_body = is_ncr_email(subject, body, attachments)
-    sched_body = is_schedule_email(subject, body, attachments)
+    sched_body = is_schedule_email(subject, body, attachments) and bool(attachments)
     body_hits = sum([mom_body, ncr_body, sched_body])
     if body_hits == 1:
         if mom_body: return "MOM"
