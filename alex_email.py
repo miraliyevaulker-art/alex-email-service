@@ -253,6 +253,15 @@ def get_ncr_tracker_sheet():
 
 
 def get_schedule_tracker_sheet():
+    """
+    Guarantees the sheet always has at least 15 columns (including
+    Responsible Role) before any caller writes to it. New sheets are
+    created with 15 columns directly; existing sheets that predate the
+    Responsible Role field are safely expanded with add_cols() before the
+    header label is written — mirroring the same fix already applied to
+    the NCR tracker, which prevents a "Range exceeds grid limits" error
+    that would otherwise abort any bulk write to the sheet.
+    """
     try:
         client = get_gspread_client()
         spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
@@ -264,12 +273,12 @@ def get_schedule_tracker_sheet():
         sheet = spreadsheet.worksheet("Schedule Tracker")
     except gspread.exceptions.WorksheetNotFound:
         try:
-            sheet = spreadsheet.add_worksheet(title="Schedule Tracker", rows=2000, cols=14)
+            sheet = spreadsheet.add_worksheet(title="Schedule Tracker", rows=2000, cols=15)
             sheet.append_row([
                 "Date Logged", "Programme Reference", "Milestone/Activity", "Responsible Party",
                 "Responsible Email", "Responsible Name", "Planned Start Date", "Status",
                 "Last Reminded", "Reminder Count", "Thread ID", "Uploaded By",
-                "All Thread Participants", "Client Emails"
+                "All Thread Participants", "Client Emails", "Responsible Role"
             ])
             return sheet
         except Exception as e:
@@ -278,6 +287,15 @@ def get_schedule_tracker_sheet():
     except Exception as e:
         logger.error(f"Schedule tracker error (opening sheet): {e}")
         return None
+
+    try:
+        headers = sheet.row_values(1)
+        if len(headers) < 15:
+            if sheet.col_count < 15:
+                sheet.add_cols(15 - sheet.col_count)
+            sheet.update_cell(1, 15, "Responsible Role")
+    except Exception as e:
+        logger.warning(f"Schedule tracker header check failed (non-fatal): {e}")
 
     return sheet
 
@@ -485,9 +503,6 @@ def save_schedule_item(programme_ref, activity, responsible_party, responsible_e
     try:
         sheet = get_schedule_tracker_sheet()
         if sheet:
-            headers = sheet.row_values(1)
-            if len(headers) < 15:
-                sheet.update_cell(1, 15, "Responsible Role")
             sheet.append_row([
                 baku_now().strftime("%d.%m.%Y %H:%M"), programme_ref, activity, responsible_party,
                 responsible_email, responsible_name, planned_start, status, "", "0", thread_id, uploaded_by,
@@ -511,9 +526,6 @@ def save_schedule_items_bulk(programme_ref, milestones, thread_id, uploaded_by, 
         sheet = get_schedule_tracker_sheet()
         if not sheet:
             return 0
-        headers = sheet.row_values(1)
-        if len(headers) < 15:
-            sheet.update_cell(1, 15, "Responsible Role")
         now_str = baku_now().strftime("%d.%m.%Y %H:%M")
         rows = []
         for m in milestones:
