@@ -684,6 +684,7 @@ def read_actions_for_report():
             data = get_action_data_from_row(row)
             status = data["status"].strip()
             record = {
+                "Date": data["date"],
                 "Action Item": data["action"],
                 "Responsible Party": data["responsible"],
                 "Responsible Name": data["responsible_name"],
@@ -722,6 +723,7 @@ def read_ncrs_for_report():
             status = data["status"].strip()
 
             record = {
+                "Date": data["date"],
                 "NCR Number": data["ncr_number"],
                 "Description": data["description"],
                 "Contractor": data["contractor"],
@@ -765,6 +767,7 @@ def read_schedule_for_report():
             days_until = (start_date - today).days
             if 0 <= days_until <= 14:
                 upcoming.append({
+                    "Date Logged": data["date_logged"],
                     "Activity": data["activity"],
                     "Responsible": data["responsible_name"] or data["responsible"],
                     "Planned Start": data["planned_start"],
@@ -2613,66 +2616,81 @@ def build_report_html(pending, closed, today, day_name, time_now, open_actions=N
     upcoming_milestones = upcoming_milestones or []
     total_open = len(pending) + len(open_actions) + len(open_ncrs)
 
+    CATEGORY_STYLE = {
+        "Internal Monitoring": {"bg": "#e1f5ee", "tx": "#0f6e56"},
+        "MOM": {"bg": "#fff0e0", "tx": "#9a5000"},
+        "NCR": {"bg": "#fdeaea", "tx": "#c00000"},
+        "Schedule Tracker": {"bg": "#f0e8fb", "tx": "#6a3fa0"},
+    }
+
+    def parse_date_safe(d):
+        try:
+            return datetime.strptime((d or "").strip(), "%d.%m.%Y %H:%M")
+        except:
+            return datetime.min
+
+    unified = []
+    for r in pending:
+        unified.append({
+            "date": r.get("Date", ""), "category": "Internal Monitoring",
+            "title": r.get("Subject") or "No subject", "sub": r.get("Sender") or "Unknown",
+            "detail": r.get("Summary") or "No summary", "extra_label": "Action required",
+            "extra": r.get("Action") or "Review required", "status": r.get("Status") or "Open"
+        })
+    for r in open_actions:
+        n = r.get("Responsible Name", "")
+        p = r.get("Responsible Party", "") or "Unknown"
+        unified.append({
+            "date": r.get("Date", ""), "category": "MOM",
+            "title": r.get("Action Item") or "No description", "sub": f"{n} ({p})" if n else p,
+            "detail": f"Meeting reference: {r.get('Meeting Reference') or 'Unknown'} — Due: {r.get('Due Date') or 'Not specified'}",
+            "extra_label": "Email", "extra": r.get("Responsible Email") or "Unknown", "status": r.get("Status") or "Open"
+        })
+    for r in open_ncrs:
+        n = r.get("Responsible Name", "")
+        c = r.get("Contractor", "") or "Unknown"
+        unified.append({
+            "date": r.get("Date", ""), "category": "NCR",
+            "title": r.get("Description") or "No description", "sub": f"{n} ({c})" if n else c,
+            "detail": f"NCR reference: {r.get('NCR Number') or 'Unknown'} — Raised: {r.get('Date Raised') or 'Not specified'}",
+            "extra_label": "Contact", "extra": r.get("Contractor Email") or "Unknown", "status": r.get("Status") or "Open"
+        })
+    for r in upcoming_milestones:
+        unified.append({
+            "date": r.get("Date Logged", ""), "category": "Schedule Tracker",
+            "title": r.get("Activity") or "No description", "sub": r.get("Responsible") or "Unknown",
+            "detail": f"Planned start: {r.get('Planned Start') or 'Not specified'} — {r.get('Days Until', '')} day(s) remaining",
+            "extra_label": "Status", "extra": r.get("Status") or "Pending", "status": r.get("Status") or "Pending"
+        })
+
+    unified.sort(key=lambda x: parse_date_safe(x["date"]), reverse=True)
+
     items_html = ""
-    for i, r in enumerate(list(reversed(pending))[:15], 1):
-        subj = r.get("Subject") or "No subject"
-        sender = r.get("Sender") or "Unknown"
-        date = r.get("Date") or "Not recorded"
-        status = r.get("Status") or "Open"
-        summary = r.get("Summary") or "No summary"
-        action = r.get("Action") or "Review required"
-        sbg = "#fff8ee" if status == "Open" else "#e1f5ee"
-        stx = "#9a6000" if status == "Open" else "#0f6e56"
-        items_html += f'<div style="border:1px solid #e8e8e8;border-radius:8px;margin-bottom:16px;overflow:hidden;"><div style="background:#f8f9fa;padding:12px 16px;display:flex;justify-content:space-between;border-bottom:1px solid #e8e8e8;"><span style="font-size:12px;color:#888;">ITEM {i} OF {len(pending)}</span><span style="background:{sbg};color:{stx};font-size:11px;padding:3px 10px;border-radius:20px;">{status}</span></div><div style="padding:16px;"><table style="width:100%;font-size:13px;border-collapse:collapse;"><tr><td style="color:#888;padding:4px 0;width:120px;">Subject</td><td style="color:#1a2942;font-weight:600;">{subj}</td></tr><tr><td style="color:#888;padding:4px 0;">From</td><td style="color:#333;">{sender}</td></tr><tr><td style="color:#888;padding:4px 0;">Date</td><td style="color:#333;">{date}</td></tr></table><div style="border-top:1px solid #f0f0f0;margin:12px 0;"></div><div style="font-size:11px;color:#888;text-transform:uppercase;margin-bottom:4px;">Summary</div><div style="font-size:13px;color:#444;line-height:1.6;margin-bottom:10px;">{summary}</div><div style="background:#fff8ee;border:1px solid #f0c060;border-radius:6px;padding:10px 12px;"><div style="font-size:10px;font-weight:600;color:#9a6000;text-transform:uppercase;margin-bottom:4px;">Action required</div><div style="font-size:13px;color:#5a3a00;">{action}</div></div></div></div>'
+    for item in unified[:40]:
+        cat = item["category"]
+        style = CATEGORY_STYLE.get(cat, {"bg": "#f0f0f0", "tx": "#555"})
+        status_bg = "#fff0f0" if item["status"] in ["Email Unknown"] else "#fff8ee"
+        status_tx = "#c00000" if item["status"] in ["Email Unknown"] else "#9a6000"
+        items_html += f'''<div style="border:1px solid #e8e8e8;border-radius:8px;margin-bottom:14px;overflow:hidden;">
+<div style="background:#f8f9fa;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #e8e8e8;">
+<div><span style="background:{style["bg"]};color:{style["tx"]};font-size:10px;font-weight:600;padding:3px 10px;border-radius:20px;letter-spacing:0.3px;">{cat.upper()}</span></div>
+<div><span style="color:#999;font-size:11px;margin-right:8px;">{item["date"] or "Not recorded"}</span><span style="background:{status_bg};color:{status_tx};font-size:11px;padding:2px 8px;border-radius:20px;">{item["status"]}</span></div>
+</div>
+<div style="padding:14px;">
+<div style="font-size:13px;color:#1a2942;font-weight:600;margin-bottom:4px;">{item["title"]}</div>
+<div style="font-size:12px;color:#666;margin-bottom:8px;">{item["sub"]}</div>
+<div style="font-size:12px;color:#444;line-height:1.6;margin-bottom:8px;">{item["detail"]}</div>
+<div style="background:#fafafa;border-radius:6px;padding:8px 10px;"><span style="font-size:10px;color:#999;text-transform:uppercase;">{item["extra_label"]}</span><br><span style="font-size:12px;color:#333;">{item["extra"]}</span></div>
+</div>
+</div>'''
 
-    ext_html = ""
-    if open_actions:
-        ext_html += '<div style="margin-top:24px;border-top:2px solid #e8e8e8;padding-top:20px;"><div style="font-size:11px;font-weight:600;color:#888;letter-spacing:1px;text-transform:uppercase;margin-bottom:12px;">External action tracker</div>'
-        for i, r in enumerate(list(reversed(open_actions))[:10], 1):
-            a = r.get("Action Item","") or "No description"
-            p = r.get("Responsible Party","") or "Unknown"
-            n = r.get("Responsible Name","") or ""
-            e = r.get("Responsible Email","") or "Unknown"
-            d = r.get("Due Date","") or "Not specified"
-            s = r.get("Status","") or "Open"
-            m = r.get("Meeting Reference","") or "Unknown"
-            display = f"{n} ({p})" if n else p
-            ext_html += f'<div style="border:1px solid #e8e8e8;border-radius:8px;margin-bottom:12px;overflow:hidden;"><div style="background:#f8f9fa;padding:10px 14px;display:flex;justify-content:space-between;border-bottom:1px solid #e8e8e8;"><span style="font-size:12px;color:#888;">External Action {i}</span><span style="background:#fff8ee;color:#9a6000;font-size:11px;padding:2px 8px;border-radius:20px;">{s}</span></div><div style="padding:14px;"><div style="font-size:13px;color:#1a2942;font-weight:600;margin-bottom:8px;">{a}</div><table style="width:100%;font-size:12px;border-collapse:collapse;"><tr><td style="color:#888;padding:3px 0;width:120px;">Responsible</td><td style="color:#333;">{display}</td></tr><tr><td style="color:#888;padding:3px 0;">Email</td><td style="color:#333;">{e}</td></tr><tr><td style="color:#888;padding:3px 0;">Due date</td><td style="color:#333;">{d}</td></tr><tr><td style="color:#888;padding:3px 0;">Meeting</td><td style="color:#333;">{m}</td></tr></table></div></div>'
-        if flagged:
-            ext_html += f'<div style="background:#fff0f0;border:1px solid #f0c0c0;border-radius:6px;padding:10px 14px;"><div style="font-size:11px;font-weight:600;color:#c00000;margin-bottom:4px;">EMAIL UNKNOWN</div><div style="font-size:12px;color:#800000;">{len(flagged)} action(s) unmatched.</div></div>'
-        ext_html += "</div>"
+    if not unified:
+        items_html = '<div style="text-align:center;padding:32px;"><div style="width:48px;height:48px;border-radius:50%;background:#e1f5ee;margin:0 auto 12px;font-size:22px;color:#3CB496;display:flex;align-items:center;justify-content:center;">&#10003;</div><div style="font-size:15px;color:#333;font-weight:500;">All clear</div><div style="font-size:13px;color:#888;margin-top:4px;">No outstanding items as of today.</div></div>'
+    elif len(unified) > 40:
+        items_html += f'<div style="text-align:center;font-size:12px;color:#999;padding:8px;">...and {len(unified) - 40} further item(s) not shown.</div>'
 
-    ncr_html = ""
-    if open_ncrs:
-        ncr_html += '<div style="margin-top:24px;border-top:2px solid #e8e8e8;padding-top:20px;"><div style="font-size:11px;font-weight:600;color:#888;letter-spacing:1px;text-transform:uppercase;margin-bottom:12px;">Open non-conformance reports</div>'
-        for i, r in enumerate(list(reversed(open_ncrs))[:10], 1):
-            num = r.get("NCR Number","") or "Unknown"
-            desc = r.get("Description","") or "No description"
-            contr = r.get("Contractor","") or "Unknown"
-            resname = r.get("Responsible Name","") or ""
-            e = r.get("Contractor Email","") or "Unknown"
-            dr = r.get("Date Raised","") or "Not specified"
-            s = r.get("Status","") or "Open"
-            display = f"{resname} ({contr})" if resname else contr
-            status_bg = "#fff0f0" if s == "Email Unknown" else "#fff8ee"
-            status_tx = "#c00000" if s == "Email Unknown" else "#9a6000"
-            ncr_html += f'<div style="border:1px solid #e8e8e8;border-radius:8px;margin-bottom:12px;overflow:hidden;"><div style="background:#3a1a1a;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;"><span style="font-size:12px;color:#e0a8a8;">NCR {num}</span><span style="background:{status_bg};color:{status_tx};font-size:11px;padding:2px 8px;border-radius:20px;">{s}</span></div><div style="padding:14px;"><div style="font-size:13px;color:#1a2942;font-weight:600;margin-bottom:8px;">{desc}</div><table style="width:100%;font-size:12px;border-collapse:collapse;"><tr><td style="color:#888;padding:3px 0;width:120px;">Contractor</td><td style="color:#333;">{display}</td></tr><tr><td style="color:#888;padding:3px 0;">Email</td><td style="color:#333;">{e}</td></tr><tr><td style="color:#888;padding:3px 0;">Date raised</td><td style="color:#333;">{dr}</td></tr></table></div></div>'
-        ncr_html += '<div style="background:#fff8ee;border:1px solid #f0c060;border-radius:6px;padding:10px 14px;margin-top:8px;"><div style="font-size:11px;color:#5a3a00;">NCRs remain open until a corrective action report is received and accepted.</div></div>'
-        ncr_html += "</div>"
-
-    milestone_html = ""
-    if upcoming_milestones:
-        milestone_html += '<div style="margin-top:24px;border-top:2px solid #e8e8e8;padding-top:20px;"><div style="font-size:11px;font-weight:600;color:#888;letter-spacing:1px;text-transform:uppercase;margin-bottom:12px;">Upcoming milestones (next 14 days)</div>'
-        for m in upcoming_milestones[:10]:
-            days = m["Days Until"]
-            urgency_bg = "#fff0f0" if days <= 3 else "#fff8ee"
-            urgency_tx = "#c00000" if days <= 3 else "#9a6000"
-            milestone_html += f'<div style="border:1px solid #e8e8e8;border-radius:8px;margin-bottom:12px;overflow:hidden;"><div style="background:#f8f9fa;padding:10px 14px;display:flex;justify-content:space-between;border-bottom:1px solid #e8e8e8;"><span style="font-size:12px;color:#888;">Starts {m["Planned Start"]}</span><span style="background:{urgency_bg};color:{urgency_tx};font-size:11px;padding:2px 8px;border-radius:20px;">{days} day(s)</span></div><div style="padding:14px;"><div style="font-size:13px;color:#1a2942;font-weight:600;margin-bottom:6px;">{m["Activity"]}</div><div style="font-size:12px;color:#333;">Responsible: {m["Responsible"]}</div></div></div>'
-        milestone_html += "</div>"
-
-    no_items = ""
-    if not pending and not open_actions and not open_ncrs and not upcoming_milestones:
-        no_items = '<div style="text-align:center;padding:32px;"><div style="width:48px;height:48px;border-radius:50%;background:#e1f5ee;margin:0 auto 12px;font-size:22px;color:#3CB496;display:flex;align-items:center;justify-content:center;">&#10003;</div><div style="font-size:15px;color:#333;font-weight:500;">All clear</div><div style="font-size:13px;color:#888;margin-top:4px;">No outstanding items as of today.</div></div>'
+    if flagged:
+        items_html += f'<div style="background:#fff0f0;border:1px solid #f0c0c0;border-radius:6px;padding:10px 14px;margin-top:8px;"><div style="font-size:11px;font-weight:600;color:#c00000;margin-bottom:4px;">EMAIL UNKNOWN</div><div style="font-size:12px;color:#800000;">{len(flagged)} MOM action(s) unmatched to a contact email.</div></div>'
 
     greeting = f"Good morning. Daily report for <strong>{today}</strong>. <strong>{total_open} open item(s)</strong> require attention." if total_open else f"Good morning. Daily report for <strong>{today}</strong>. All items are clear."
 
@@ -2698,12 +2716,8 @@ def build_report_html(pending, closed, today, day_name, time_now, open_actions=N
   </div>
   <div style="background:#fff;border:1px solid #e8e8e8;border-top:none;border-radius:0 0 12px 12px;padding:24px 28px;">
     <p style="font-size:14px;color:#444;line-height:1.7;margin:0 0 20px;">{greeting}</p>
-    {"<div style='font-size:11px;font-weight:600;color:#888;letter-spacing:1px;text-transform:uppercase;margin-bottom:12px;'>Internal outstanding items</div>" if pending else ""}
+    {"<div style='font-size:11px;font-weight:600;color:#888;letter-spacing:1px;text-transform:uppercase;margin-bottom:12px;'>All open items, newest to oldest</div>" if unified else ""}
     {items_html}
-    {ext_html}
-    {ncr_html}
-    {milestone_html}
-    {no_items}
     <div style="border-top:1px solid #f0f0f0;margin-top:24px;padding-top:20px;display:flex;justify-content:space-between;">
       <div style="font-size:12px;color:#666;line-height:1.8;"><strong style="color:#1a2942;font-size:13px;">Alex Rivera</strong><br>Construction Expert<br>SCOPE Consulting MMC<br><span style="color:#3CB496;">internal@scope-iq.io</span></div>
       <div style="font-size:11px;color:#aaa;text-align:right;line-height:1.7;">Generated automatically<br>SCOPE IQ<br>09:00 Baku daily</div>
