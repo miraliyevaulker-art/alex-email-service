@@ -2617,10 +2617,10 @@ def build_report_html(pending, closed, today, day_name, time_now, open_actions=N
     total_open = len(pending) + len(open_actions) + len(open_ncrs)
 
     CATEGORY_STYLE = {
-        "Internal Monitoring": {"bg": "#e1f5ee", "tx": "#0f6e56"},
-        "MOM": {"bg": "#fff0e0", "tx": "#9a5000"},
-        "NCR": {"bg": "#fdeaea", "tx": "#c00000"},
-        "Schedule Tracker": {"bg": "#f0e8fb", "tx": "#6a3fa0"},
+        "Internal Monitoring": {"accent": "#3f9d78", "tx": "#3f9d78"},
+        "MOM": {"accent": "#c98a3a", "tx": "#c98a3a"},
+        "NCR": {"accent": "#c94b4b", "tx": "#c94b4b"},
+        "Schedule Tracker": {"accent": "#8a5fc9", "tx": "#8a5fc9"},
     }
 
     def parse_date_safe(d):
@@ -2629,12 +2629,19 @@ def build_report_html(pending, closed, today, day_name, time_now, open_actions=N
         except:
             return datetime.min
 
+    def short_date(d):
+        try:
+            dt = datetime.strptime((d or "").strip(), "%d.%m.%Y %H:%M")
+            return dt.strftime("%d %b, %H:%M")
+        except:
+            return d or "Not recorded"
+
     unified = []
     for r in pending:
         unified.append({
             "date": r.get("Date", ""), "category": "Internal Monitoring",
             "title": r.get("Subject") or "No subject", "sub": r.get("Sender") or "Unknown",
-            "detail": r.get("Summary") or "No summary", "extra_label": "Action required",
+            "detail": r.get("Summary") or "No summary", "extra_label": "Action",
             "extra": r.get("Action") or "Review required", "status": r.get("Status") or "Open"
         })
     for r in open_actions:
@@ -2643,7 +2650,7 @@ def build_report_html(pending, closed, today, day_name, time_now, open_actions=N
         unified.append({
             "date": r.get("Date", ""), "category": "MOM",
             "title": r.get("Action Item") or "No description", "sub": f"{n} ({p})" if n else p,
-            "detail": f"Meeting reference: {r.get('Meeting Reference') or 'Unknown'} — Due: {r.get('Due Date') or 'Not specified'}",
+            "detail": f"{r.get('Meeting Reference') or 'Unknown'} · due {r.get('Due Date') or 'not specified'}",
             "extra_label": "Email", "extra": r.get("Responsible Email") or "Unknown", "status": r.get("Status") or "Open"
         })
     for r in open_ncrs:
@@ -2652,14 +2659,14 @@ def build_report_html(pending, closed, today, day_name, time_now, open_actions=N
         unified.append({
             "date": r.get("Date", ""), "category": "NCR",
             "title": r.get("Description") or "No description", "sub": f"{n} ({c})" if n else c,
-            "detail": f"NCR reference: {r.get('NCR Number') or 'Unknown'} — Raised: {r.get('Date Raised') or 'Not specified'}",
+            "detail": f"{r.get('NCR Number') or 'Unknown'} · raised {r.get('Date Raised') or 'not specified'}",
             "extra_label": "Contact", "extra": r.get("Contractor Email") or "Unknown", "status": r.get("Status") or "Open"
         })
     for r in upcoming_milestones:
         unified.append({
             "date": r.get("Date Logged", ""), "category": "Schedule Tracker",
             "title": r.get("Activity") or "No description", "sub": r.get("Responsible") or "Unknown",
-            "detail": f"Planned start: {r.get('Planned Start') or 'Not specified'} — {r.get('Days Until', '')} day(s) remaining",
+            "detail": f"starts {r.get('Planned Start') or 'not specified'} · {r.get('Days Until', '')} day(s) remaining",
             "extra_label": "Status", "extra": r.get("Status") or "Pending", "status": r.get("Status") or "Pending"
         })
 
@@ -2668,61 +2675,55 @@ def build_report_html(pending, closed, today, day_name, time_now, open_actions=N
     items_html = ""
     for item in unified[:40]:
         cat = item["category"]
-        style = CATEGORY_STYLE.get(cat, {"bg": "#f0f0f0", "tx": "#555"})
-        status_bg = "#fff0f0" if item["status"] in ["Email Unknown"] else "#fff8ee"
-        status_tx = "#c00000" if item["status"] in ["Email Unknown"] else "#9a6000"
-        items_html += f'''<div style="border:1px solid #e8e8e8;border-radius:8px;margin-bottom:14px;overflow:hidden;">
-<div style="background:#f8f9fa;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #e8e8e8;">
-<div><span style="background:{style["bg"]};color:{style["tx"]};font-size:10px;font-weight:600;padding:3px 10px;border-radius:20px;letter-spacing:0.3px;">{cat.upper()}</span></div>
-<div><span style="color:#999;font-size:11px;margin-right:8px;">{item["date"] or "Not recorded"}</span><span style="background:{status_bg};color:{status_tx};font-size:11px;padding:2px 8px;border-radius:20px;">{item["status"]}</span></div>
+        style = CATEGORY_STYLE.get(cat, {"accent": "#999", "tx": "#666"})
+        status_bg = "#fdf3e8" if item["status"] not in ["Email Unknown"] else "#fdeaea"
+        status_tx = "#a06a1e" if item["status"] not in ["Email Unknown"] else "#c00000"
+        cat_label = "MONITORING" if cat == "Internal Monitoring" else ("SCHEDULE" if cat == "Schedule Tracker" else cat.upper())
+        items_html += f'''<div style="background:#fff;border-radius:10px;border:1px solid #ece9e2;border-left:3px solid {style["accent"]};margin-bottom:10px;padding:13px 16px;">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+<span style="font-size:9.5px;font-weight:600;letter-spacing:0.6px;color:{style["tx"]};">{cat_label}</span>
+<div><span style="font-size:10px;color:#a8a69c;margin-right:8px;">{short_date(item["date"])}</span><span style="background:{status_bg};color:{status_tx};font-size:9.5px;padding:2px 8px;border-radius:20px;">{item["status"]}</span></div>
 </div>
-<div style="padding:14px;">
-<div style="font-size:13px;color:#1a2942;font-weight:600;margin-bottom:4px;">{item["title"]}</div>
-<div style="font-size:12px;color:#666;margin-bottom:8px;">{item["sub"]}</div>
-<div style="font-size:12px;color:#444;line-height:1.6;margin-bottom:8px;">{item["detail"]}</div>
-<div style="background:#fafafa;border-radius:6px;padding:8px 10px;"><span style="font-size:10px;color:#999;text-transform:uppercase;">{item["extra_label"]}</span><br><span style="font-size:12px;color:#333;">{item["extra"]}</span></div>
-</div>
+<div style="font-size:13px;color:#1a2942;font-weight:600;margin-bottom:2px;">{item["title"]}</div>
+<div style="font-size:11.5px;color:#9a988f;margin-bottom:8px;">{item["sub"]} &nbsp;·&nbsp; {item["detail"]}</div>
+<div style="font-size:11.5px;color:#6b6a63;">{item["extra_label"]} &nbsp;<span style="color:#3a3a35;">{item["extra"]}</span></div>
 </div>'''
 
     if not unified:
-        items_html = '<div style="text-align:center;padding:32px;"><div style="width:48px;height:48px;border-radius:50%;background:#e1f5ee;margin:0 auto 12px;font-size:22px;color:#3CB496;display:flex;align-items:center;justify-content:center;">&#10003;</div><div style="font-size:15px;color:#333;font-weight:500;">All clear</div><div style="font-size:13px;color:#888;margin-top:4px;">No outstanding items as of today.</div></div>'
+        items_html = '<div style="text-align:center;padding:32px;"><div style="width:48px;height:48px;border-radius:50%;background:#e8f5ef;margin:0 auto 12px;font-size:22px;color:#3f9d78;display:flex;align-items:center;justify-content:center;">&#10003;</div><div style="font-size:15px;color:#333;font-weight:500;">All clear</div><div style="font-size:13px;color:#9a988f;margin-top:4px;">No outstanding items as of today.</div></div>'
     elif len(unified) > 40:
-        items_html += f'<div style="text-align:center;font-size:12px;color:#999;padding:8px;">...and {len(unified) - 40} further item(s) not shown.</div>'
+        items_html += f'<div style="text-align:center;font-size:12px;color:#a8a69c;padding:8px;">...and {len(unified) - 40} further item(s) not shown.</div>'
 
     if flagged:
-        items_html += f'<div style="background:#fff0f0;border:1px solid #f0c0c0;border-radius:6px;padding:10px 14px;margin-top:8px;"><div style="font-size:11px;font-weight:600;color:#c00000;margin-bottom:4px;">EMAIL UNKNOWN</div><div style="font-size:12px;color:#800000;">{len(flagged)} MOM action(s) unmatched to a contact email.</div></div>'
+        items_html += f'<div style="background:#fdeaea;border:1px solid #f0c0c0;border-radius:8px;padding:10px 14px;margin-top:8px;"><div style="font-size:11px;font-weight:600;color:#c00000;margin-bottom:4px;">EMAIL UNKNOWN</div><div style="font-size:12px;color:#8a2a2a;">{len(flagged)} MOM action(s) unmatched to a contact email.</div></div>'
 
-    greeting = f"Good morning. Daily report for <strong>{today}</strong>. <strong>{total_open} open item(s)</strong> require attention." if total_open else f"Good morning. Daily report for <strong>{today}</strong>. All items are clear."
+    greeting = f"Good morning. <strong style=\"color:#1a2942;\">{total_open} open item(s)</strong> require attention today, shown newest to oldest below." if total_open else "Good morning. All items are clear today."
 
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif;">
-<div style="max-width:620px;margin:0 auto;padding:20px 0;">
-  <div style="background:#1a2942;border-radius:12px 12px 0 0;padding:24px 28px;">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
-      <div style="color:#fff;font-size:22px;font-weight:600;">SCOPE <span style="color:#3CB496;">IQ</span></div>
-      <div style="background:#3CB496;color:#fff;font-size:11px;padding:4px 12px;border-radius:20px;">Daily Report</div>
+<body style="margin:0;padding:0;background:#f6f6f4;font-family:Arial,sans-serif;">
+<div style="max-width:600px;margin:0 auto;padding:20px 0;">
+  <div style="background:#182338;border-radius:14px 14px 0 0;padding:26px 28px 22px;">
+    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:16px;">
+      <div style="color:#fff;font-size:19px;font-weight:600;letter-spacing:0.3px;">SCOPE <span style="color:#4fc3a1;font-weight:400;">IQ</span></div>
+      <div style="color:#7a8ba8;font-size:10px;letter-spacing:1.2px;text-transform:uppercase;">Daily report</div>
     </div>
-    <table style="width:100%;font-size:12px;border-collapse:collapse;">
-      <tr><td style="color:#8facc8;padding:2px 0;width:50%;">Date &nbsp;<strong style="color:#c8ddf0;">{day_name}, {today}</strong></td><td style="color:#8facc8;padding:2px 0;">Time &nbsp;<strong style="color:#c8ddf0;">{time_now} Baku</strong></td></tr>
-      <tr><td style="color:#8facc8;padding:2px 0;">Prepared by &nbsp;<strong style="color:#c8ddf0;">Alex Rivera</strong></td><td style="color:#8facc8;padding:2px 0;">Status &nbsp;<strong style="color:#c8ddf0;">{"All clear" if total_open == 0 else f"{total_open} open"}</strong></td></tr>
-    </table>
+    <div style="color:#c3d0e3;font-size:12px;">{day_name}, {today} &nbsp;·&nbsp; {time_now} Baku &nbsp;·&nbsp; prepared by Alex Rivera</div>
   </div>
-  <div style="background:#243550;padding:12px 28px;display:flex;">
-    <div style="flex:1;text-align:center;border-right:1px solid #1a2942;"><div style="font-size:20px;font-weight:600;color:#f0a030;">{n_open}</div><div style="font-size:10px;color:#8facc8;margin-top:2px;">Internal Open</div></div>
-    <div style="flex:1;text-align:center;border-right:1px solid #1a2942;"><div style="font-size:20px;font-weight:600;color:#3CB496;">{n_monitor}</div><div style="font-size:10px;color:#8facc8;margin-top:2px;">Monitoring</div></div>
-    <div style="flex:1;text-align:center;border-right:1px solid #1a2942;"><div style="font-size:20px;font-weight:600;color:#e07030;">{len(open_actions)}</div><div style="font-size:10px;color:#8facc8;margin-top:2px;">External Actions</div></div>
-    <div style="flex:1;text-align:center;border-right:1px solid #1a2942;"><div style="font-size:20px;font-weight:600;color:#e05050;">{len(open_ncrs)}</div><div style="font-size:10px;color:#8facc8;margin-top:2px;">Open NCRs</div></div>
-    <div style="flex:1;text-align:center;"><div style="font-size:20px;font-weight:600;color:#6ab87a;">{n_closed}</div><div style="font-size:10px;color:#8facc8;margin-top:2px;">Closed</div></div>
+  <div style="background:#fff;padding:18px 28px;display:flex;border-bottom:1px solid #ece9e2;">
+    <div style="flex:1;text-align:center;"><div style="font-size:19px;font-weight:600;color:#1a2942;">{n_open}</div><div style="font-size:9.5px;color:#9a988f;margin-top:3px;letter-spacing:0.3px;">INTERNAL</div></div>
+    <div style="flex:1;text-align:center;border-left:1px solid #ece9e2;"><div style="font-size:19px;font-weight:600;color:#1a2942;">{n_monitor}</div><div style="font-size:9.5px;color:#9a988f;margin-top:3px;letter-spacing:0.3px;">MONITORING</div></div>
+    <div style="flex:1;text-align:center;border-left:1px solid #ece9e2;"><div style="font-size:19px;font-weight:600;color:#1a2942;">{len(open_actions)}</div><div style="font-size:9.5px;color:#9a988f;margin-top:3px;letter-spacing:0.3px;">ACTIONS</div></div>
+    <div style="flex:1;text-align:center;border-left:1px solid #ece9e2;"><div style="font-size:19px;font-weight:600;color:#1a2942;">{len(open_ncrs)}</div><div style="font-size:9.5px;color:#9a988f;margin-top:3px;letter-spacing:0.3px;">NCRs</div></div>
+    <div style="flex:1;text-align:center;border-left:1px solid #ece9e2;"><div style="font-size:19px;font-weight:600;color:#4fa16f;">{n_closed}</div><div style="font-size:9.5px;color:#9a988f;margin-top:3px;letter-spacing:0.3px;">CLOSED</div></div>
   </div>
-  <div style="background:#fff;border:1px solid #e8e8e8;border-top:none;border-radius:0 0 12px 12px;padding:24px 28px;">
-    <p style="font-size:14px;color:#444;line-height:1.7;margin:0 0 20px;">{greeting}</p>
-    {"<div style='font-size:11px;font-weight:600;color:#888;letter-spacing:1px;text-transform:uppercase;margin-bottom:12px;'>All open items, newest to oldest</div>" if unified else ""}
+  <div style="background:#f6f6f4;border-radius:0 0 14px 14px;padding:22px 28px 26px;">
+    <p style="font-size:13px;color:#4a4a45;line-height:1.6;margin:0 0 20px;">{greeting}</p>
     {items_html}
-    <div style="border-top:1px solid #f0f0f0;margin-top:24px;padding-top:20px;display:flex;justify-content:space-between;">
-      <div style="font-size:12px;color:#666;line-height:1.8;"><strong style="color:#1a2942;font-size:13px;">Alex Rivera</strong><br>Construction Expert<br>SCOPE Consulting MMC<br><span style="color:#3CB496;">internal@scope-iq.io</span></div>
-      <div style="font-size:11px;color:#aaa;text-align:right;line-height:1.7;">Generated automatically<br>SCOPE IQ<br>09:00 Baku daily</div>
+    <div style="border-top:1px solid #ece9e2;margin-top:22px;padding-top:18px;display:flex;justify-content:space-between;align-items:flex-end;">
+      <div style="font-size:11px;color:#8a8880;line-height:1.7;"><strong style="color:#1a2942;font-size:12px;">Alex Rivera</strong><br>Construction Expert, SCOPE Consulting MMC<br><span style="color:#4fc3a1;">internal@scope-iq.io</span></div>
+      <div style="font-size:9.5px;color:#b0aea3;text-align:right;">Generated automatically</div>
     </div>
-    <div style="background:#f8f9fa;border-radius:6px;padding:10px 14px;margin-top:16px;"><div style="font-size:11px;color:#888;"><strong style="color:#555;">Chase protocol:</strong> Draft at day 3, 7, 14 &nbsp;·&nbsp; Auto-close at day 21 (NCRs remain open until resolved). Milestone notices: exactly 2 per milestone, 7 days and 3 days before start. Reply to this report anytime with an instruction to trigger a follow-up on demand.</div></div>
+    <div style="background:#fff;border:1px solid #ece9e2;border-radius:8px;padding:10px 14px;margin-top:16px;"><div style="font-size:11px;color:#9a988f;"><strong style="color:#6b6a63;">Chase protocol:</strong> draft at day 3, 7, 14 &nbsp;·&nbsp; auto-close at day 21 (NCRs remain open until resolved). Milestone notices: exactly 2 per milestone, 7 and 3 days before start. Reply to this report anytime with an instruction to trigger a follow-up on demand.</div></div>
   </div>
 </div></body></html>"""
 
