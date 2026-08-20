@@ -2679,18 +2679,19 @@ def build_report_html(pending, closed, today, day_name, time_now, open_actions=N
         status_bg = "#fdf3e8" if item["status"] not in ["Email Unknown"] else "#fdeaea"
         status_tx = "#a06a1e" if item["status"] not in ["Email Unknown"] else "#c00000"
         cat_label = "MONITORING" if cat == "Internal Monitoring" else ("SCHEDULE" if cat == "Schedule Tracker" else cat.upper())
-        items_html += f'''<div style="background:#fff;border-radius:10px;border:1px solid #ece9e2;border-left:3px solid {style["accent"]};margin-bottom:10px;padding:13px 16px;">
-<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
-<span style="font-size:9.5px;font-weight:600;letter-spacing:0.6px;color:{style["tx"]};">{cat_label}</span>
-<div><span style="font-size:10px;color:#a8a69c;margin-right:8px;">{short_date(item["date"])}</span><span style="background:{status_bg};color:{status_tx};font-size:9.5px;padding:2px 8px;border-radius:20px;">{item["status"]}</span></div>
+        items_html += f'''<div style="background:#fff;border-radius:10px;border:1px solid #e5e2da;border-left:4px solid {style["accent"]};margin-bottom:12px;padding:16px 18px;">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:9px;">
+<span style="font-size:10.5px;font-weight:700;letter-spacing:0.8px;color:{style["tx"]};">{cat_label}</span>
+<div><span style="font-size:11px;color:#8f8d84;margin-right:8px;">{short_date(item["date"])}</span><span style="background:{status_bg};color:{status_tx};font-size:10.5px;font-weight:600;padding:3px 10px;border-radius:20px;">{item["status"]}</span></div>
 </div>
-<div style="font-size:13px;color:#1a2942;font-weight:600;margin-bottom:2px;">{item["title"]}</div>
-<div style="font-size:11.5px;color:#9a988f;margin-bottom:8px;">{item["sub"]} &nbsp;·&nbsp; {item["detail"]}</div>
-<div style="font-size:11.5px;color:#6b6a63;">{item["extra_label"]} &nbsp;<span style="color:#3a3a35;">{item["extra"]}</span></div>
+<div style="font-size:14.5px;color:#1a2942;font-weight:700;line-height:1.4;margin-bottom:5px;">{item["title"]}</div>
+<div style="font-size:12.5px;color:#7d7b72;margin-bottom:4px;">{item["sub"]}</div>
+<div style="font-size:12px;color:#a8a69c;margin-bottom:10px;">{item["detail"]}</div>
+<div style="background:#faf9f6;border-radius:6px;padding:8px 11px;font-size:12px;color:#6b6a63;"><span style="color:#9a988f;">{item["extra_label"]}:</span> <span style="color:#2a2a26;font-weight:500;">{item["extra"]}</span></div>
 </div>'''
 
     if not unified:
-        items_html = '<div style="text-align:center;padding:32px;"><div style="width:48px;height:48px;border-radius:50%;background:#e8f5ef;margin:0 auto 12px;font-size:22px;color:#3f9d78;display:flex;align-items:center;justify-content:center;">&#10003;</div><div style="font-size:15px;color:#333;font-weight:500;">All clear</div><div style="font-size:13px;color:#9a988f;margin-top:4px;">No outstanding items as of today.</div></div>'
+        items_html = '<div style="text-align:center;padding:36px 20px;"><div style="width:52px;height:52px;border-radius:50%;background:#e8f5ef;margin:0 auto 14px;font-size:24px;color:#3f9d78;display:flex;align-items:center;justify-content:center;">&#10003;</div><div style="font-size:16px;color:#1a2942;font-weight:600;">All clear</div><div style="font-size:13px;color:#9a988f;margin-top:5px;">No outstanding items as of today.</div></div>'
     elif len(unified) > 40:
         items_html += f'<div style="text-align:center;font-size:12px;color:#a8a69c;padding:8px;">...and {len(unified) - 40} further item(s) not shown.</div>'
 
@@ -2702,22 +2703,22 @@ def build_report_html(pending, closed, today, day_name, time_now, open_actions=N
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:0;background:#f6f6f4;font-family:Arial,sans-serif;">
 <div style="max-width:600px;margin:0 auto;padding:20px 0;">
-  <div style="background:#182338;border-radius:14px 14px 0 0;padding:26px 28px 22px;">
-    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:16px;">
-      <div style="color:#fff;font-size:19px;font-weight:600;letter-spacing:0.3px;">SCOPE <span style="color:#4fc3a1;font-weight:400;">IQ</span></div>
-      <div style="color:#7a8ba8;font-size:10px;letter-spacing:1.2px;text-transform:uppercase;">Daily report</div>
+  <div style="background:#182338;border-radius:14px 14px 0 0;padding:28px 28px 22px;">
+    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:14px;">
+      <div style="color:#fff;font-size:20px;font-weight:700;letter-spacing:0.3px;">SCOPE <span style="color:#4fc3a1;font-weight:400;">IQ</span></div>
+      <div style="color:#8ea0bd;font-size:10.5px;letter-spacing:1.2px;text-transform:uppercase;font-weight:600;">Daily report</div>
     </div>
-    <div style="color:#c3d0e3;font-size:12px;">{day_name}, {today} &nbsp;·&nbsp; {time_now} Baku &nbsp;·&nbsp; prepared by Alex Rivera</div>
+    <div style="color:#d3ddec;font-size:13px;">{day_name}, {today} &nbsp;·&nbsp; {time_now} Baku &nbsp;·&nbsp; prepared by Alex Rivera</div>
   </div>
-  <div style="background:#fff;padding:18px 28px;display:flex;border-bottom:1px solid #ece9e2;">
-    <div style="flex:1;text-align:center;"><div style="font-size:19px;font-weight:600;color:#1a2942;">{n_open}</div><div style="font-size:9.5px;color:#9a988f;margin-top:3px;letter-spacing:0.3px;">INTERNAL</div></div>
-    <div style="flex:1;text-align:center;border-left:1px solid #ece9e2;"><div style="font-size:19px;font-weight:600;color:#1a2942;">{n_monitor}</div><div style="font-size:9.5px;color:#9a988f;margin-top:3px;letter-spacing:0.3px;">MONITORING</div></div>
-    <div style="flex:1;text-align:center;border-left:1px solid #ece9e2;"><div style="font-size:19px;font-weight:600;color:#1a2942;">{len(open_actions)}</div><div style="font-size:9.5px;color:#9a988f;margin-top:3px;letter-spacing:0.3px;">ACTIONS</div></div>
-    <div style="flex:1;text-align:center;border-left:1px solid #ece9e2;"><div style="font-size:19px;font-weight:600;color:#1a2942;">{len(open_ncrs)}</div><div style="font-size:9.5px;color:#9a988f;margin-top:3px;letter-spacing:0.3px;">NCRs</div></div>
-    <div style="flex:1;text-align:center;border-left:1px solid #ece9e2;"><div style="font-size:19px;font-weight:600;color:#4fa16f;">{n_closed}</div><div style="font-size:9.5px;color:#9a988f;margin-top:3px;letter-spacing:0.3px;">CLOSED</div></div>
+  <div style="background:#fff;padding:20px 28px;display:flex;border-bottom:1px solid #ece9e2;">
+    <div style="flex:1;text-align:center;"><div style="font-size:21px;font-weight:700;color:#1a2942;">{n_open}</div><div style="font-size:10px;color:#8f8d84;margin-top:4px;letter-spacing:0.4px;font-weight:600;">INTERNAL</div></div>
+    <div style="flex:1;text-align:center;border-left:1px solid #ece9e2;"><div style="font-size:21px;font-weight:700;color:#1a2942;">{n_monitor}</div><div style="font-size:10px;color:#8f8d84;margin-top:4px;letter-spacing:0.4px;font-weight:600;">MONITORING</div></div>
+    <div style="flex:1;text-align:center;border-left:1px solid #ece9e2;"><div style="font-size:21px;font-weight:700;color:#1a2942;">{len(open_actions)}</div><div style="font-size:10px;color:#8f8d84;margin-top:4px;letter-spacing:0.4px;font-weight:600;">ACTIONS</div></div>
+    <div style="flex:1;text-align:center;border-left:1px solid #ece9e2;"><div style="font-size:21px;font-weight:700;color:#1a2942;">{len(open_ncrs)}</div><div style="font-size:10px;color:#8f8d84;margin-top:4px;letter-spacing:0.4px;font-weight:600;">NCRs</div></div>
+    <div style="flex:1;text-align:center;border-left:1px solid #ece9e2;"><div style="font-size:21px;font-weight:700;color:#4fa16f;">{n_closed}</div><div style="font-size:10px;color:#8f8d84;margin-top:4px;letter-spacing:0.4px;font-weight:600;">CLOSED</div></div>
   </div>
-  <div style="background:#f6f6f4;border-radius:0 0 14px 14px;padding:22px 28px 26px;">
-    <p style="font-size:13px;color:#4a4a45;line-height:1.6;margin:0 0 20px;">{greeting}</p>
+  <div style="background:#f6f6f4;border-radius:0 0 14px 14px;padding:24px 28px 26px;">
+    <p style="font-size:14px;color:#3a3935;line-height:1.65;margin:0 0 22px;">{greeting}</p>
     {items_html}
     <div style="border-top:1px solid #ece9e2;margin-top:22px;padding-top:18px;display:flex;justify-content:space-between;align-items:flex-end;">
       <div style="font-size:11px;color:#8a8880;line-height:1.7;"><strong style="color:#1a2942;font-size:12px;">Alex Rivera</strong><br>Construction Expert, SCOPE Consulting MMC<br><span style="color:#4fc3a1;">internal@scope-iq.io</span></div>
