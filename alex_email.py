@@ -3103,8 +3103,6 @@ def check_schedule_milestone_reminders():
                 data = get_schedule_data_from_row(row)
                 if data["status"] not in ["Pending", "Notice Sent"]:
                     continue
-                if data["email"] in ["UNKNOWN", ""]:
-                    continue
                 try:
                     start_date = datetime.strptime(data["planned_start"], "%d.%m.%Y").date()
                 except:
@@ -3113,7 +3111,15 @@ def check_schedule_milestone_reminders():
                 days_until = (start_date - today).days
 
                 if days_until < 0:
+                    # Expired milestones are marked Started regardless of
+                    # whether a contact was ever supplied — previously the
+                    # UNKNOWN-email check ran first, so an expired milestone
+                    # with no contact would never resolve and would sit as
+                    # "Pending" indefinitely.
                     update_schedule_row(i, status="Started")
+                    continue
+
+                if data["email"] in ["UNKNOWN", ""]:
                     continue
 
                 reminder_count = data["reminder_count"]
