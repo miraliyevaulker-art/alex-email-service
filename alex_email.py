@@ -283,12 +283,18 @@ def get_ncr_tracker_sheet():
         logger.error(f"NCR tracker error (opening sheet): {e}")
         return None
 
+    EXPECTED_NCR_HEADERS = [
+        "Date Logged", "NCR Number", "Description", "Contractor", "Contractor Email", "Date Raised",
+        "Status", "Last Reminded", "Reminder Count", "Thread ID", "Raised By", "CAR Received",
+        "CAR Content", "Notes", "All Thread Participants", "Responsible Name", "Client Emails"
+    ]
+
     try:
         headers = sheet.row_values(1)
-        if len(headers) < 17:
-            if sheet.col_count < 17:
-                sheet.add_cols(17 - sheet.col_count)
-            sheet.update_cell(1, 17, "Client Emails")
+        if len(headers) < len(EXPECTED_NCR_HEADERS) or (headers and headers[0].strip() != "Date Logged"):
+            if sheet.col_count < len(EXPECTED_NCR_HEADERS):
+                sheet.add_cols(len(EXPECTED_NCR_HEADERS) - sheet.col_count)
+            sheet.update("A1:Q1", [EXPECTED_NCR_HEADERS])
     except Exception as e:
         logger.warning(f"NCR tracker header check failed (non-fatal): {e}")
 
@@ -331,12 +337,27 @@ def get_schedule_tracker_sheet():
         logger.error(f"Schedule tracker error (opening sheet): {e}")
         return None
 
+    EXPECTED_SCHEDULE_HEADERS = [
+        "Date Logged", "Programme Reference", "Milestone/Activity", "Responsible Party",
+        "Responsible Email", "Responsible Name", "Planned Start Date", "Status",
+        "Last Reminded", "Reminder Count", "Thread ID", "Uploaded By",
+        "All Thread Participants", "Client Emails", "Responsible Role"
+    ]
+
     try:
         headers = sheet.row_values(1)
-        if len(headers) < 15:
-            if sheet.col_count < 15:
-                sheet.add_cols(15 - sheet.col_count)
-            sheet.update_cell(1, 15, "Responsible Role")
+        if len(headers) < len(EXPECTED_SCHEDULE_HEADERS) or (headers and headers[0].strip() != "Date Logged"):
+            # Rewrites the ENTIRE header row whenever it's short or doesn't
+            # start correctly — not just the trailing column. A prior
+            # version only ever patched the last missing column, which
+            # meant a sheet that was ever created via a partial failure
+            # (worksheet created successfully, but the header-writing
+            # append_row call failed) would stay permanently headerless in
+            # columns 1-14, since this check never looked past "is the
+            # column count long enough."
+            if sheet.col_count < len(EXPECTED_SCHEDULE_HEADERS):
+                sheet.add_cols(len(EXPECTED_SCHEDULE_HEADERS) - sheet.col_count)
+            sheet.update("A1:O1", [EXPECTED_SCHEDULE_HEADERS])
     except Exception as e:
         logger.warning(f"Schedule tracker header check failed (non-fatal): {e}")
 
