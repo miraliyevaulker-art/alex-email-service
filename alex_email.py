@@ -26,6 +26,49 @@ def baku_now():
     """
     return datetime.now(BAKU_TZ)
 
+
+def parse_flexible_date(date_str):
+    """
+    Parses a planned-start date string tried against several common
+    formats. The schedule extraction prompt instructs the AI to always
+    return DD.MM.YYYY, but AI output is not perfectly reliable — a single
+    milestone returned in a different format (e.g. 2026-08-24 or
+    24 August 2026) would previously fail the strict DD.MM.YYYY parser and
+    silently vanish from every future check forever, with no visible
+    error anywhere. This is very likely the root cause of milestone
+    follow-ups appearing to "not work at all" for an entire uploaded
+    programme. Returns a date object, or None if truly unparseable.
+    """
+    if not date_str:
+        return None
+    s = date_str.strip()
+    formats = [
+        "%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y",
+        "%d %B %Y", "%d %b %Y", "%B %d, %Y", "%B %d %Y", "%Y.%m.%d",
+        "%d.%m.%y", "%d/%m/%y"
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(s, fmt).date()
+        except:
+            continue
+    return None
+
+
+def normalize_planned_start(date_str):
+    """
+    Converts any recognized date format into the canonical DD.MM.YYYY
+    string used for storage and display everywhere else in the system.
+    If the date is genuinely unparseable, the original string is kept
+    as-is (so nothing is silently lost), but it will still fail downstream
+    checks — this is intentionally rare since parse_flexible_date covers
+    every format the AI has been observed to return.
+    """
+    parsed = parse_flexible_date(date_str)
+    if parsed:
+        return parsed.strftime("%d.%m.%Y")
+    return date_str
+
 ZOHO_EMAIL        = os.environ.get("ZOHO_EMAIL", "internal@scope-iq.io")
 ZOHO_APP_PASSWORD = os.environ.get("ZOHO_APP_PASSWORD")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
@@ -505,7 +548,7 @@ def save_schedule_item(programme_ref, activity, responsible_party, responsible_e
         if sheet:
             sheet.append_row([
                 baku_now().strftime("%d.%m.%Y %H:%M"), programme_ref, activity, responsible_party,
-                responsible_email, responsible_name, planned_start, status, "", "0", thread_id, uploaded_by,
+                responsible_email, responsible_name, normalize_planned_start(planned_start), status, "", "0", thread_id, uploaded_by,
                 ",".join(all_participants), ",".join(client_emails), responsible_role
             ])
     except Exception as e:
@@ -532,7 +575,7 @@ def save_schedule_items_bulk(programme_ref, milestones, thread_id, uploaded_by, 
             resp_email = m.get("responsible_email", "UNKNOWN")
             rows.append([
                 now_str, programme_ref, m.get("activity", ""), m.get("responsible_party", "Unknown"),
-                resp_email, m.get("responsible_name", ""), m.get("planned_start", ""), "Pending",
+                resp_email, m.get("responsible_name", ""), normalize_planned_start(m.get("planned_start", "")), "Pending",
                 "", "0", thread_id, uploaded_by, ",".join(all_participants), ",".join(client_emails),
                 m.get("responsible_role", "Contractor")
             ])
@@ -577,6 +620,47 @@ def get_schedule_data_from_row(row):
         "client_emails": client_emails,
         "responsible_role": row[14].strip() if len(row) > 14 and row[14].strip() else "Contractor"
     }
+
+
+def normalize_existing_schedule_dates():
+    """
+    One-time repair pass, run once at service startup. Scans every row in
+    the Schedule Tracker and corrects any Planned Start Date that isn't
+    already in canonical DD.MM.YYYY format (i.e. milestones saved before
+    the flexible-date-parsing fix existed, or any that still slipped
+    through in a non-standard format). This clears any pre-existing
+    "stuck forever" milestones without requiring manual correction in the
+    sheet. Uses a single batch_update call — safe to run on every startup,
+    since already-correct dates are left untouched and it becomes a no-op
+    once everything is normalized.
+    """
+    try:
+        sheet = get_schedule_tracker_sheet()
+        if not sheet:
+            return
+        all_values = sheet.get_all_values()
+        batch_data = []
+        fixed_count = 0
+        for i, row in enumerate(all_values[1:], start=2):
+            if len(row) < 7:
+                continue
+            raw = row[6].strip() if len(row) > 6 else ""
+            if not raw:
+                continue
+            try:
+                datetime.strptime(raw, "%d.%m.%Y")
+                continue
+            except:
+                pass
+            normalized = normalize_planned_start(raw)
+            if normalized and normalized != raw:
+                batch_data.append({"range": f"G{i}", "values": [[normalized]]})
+                fixed_count += 1
+        if batch_data:
+            sheet.batch_update(batch_data, value_input_option="USER_ENTERED")
+            logger.info(f"Startup repair: normalized {fixed_count} schedule date(s) to DD.MM.YYYY format")
+    except Exception as e:
+        logger.error(f"Normalize existing schedule dates error: {e}")
 
 
 def find_all_open_schedule_matching_refs(in_reply_to, references):
@@ -761,7 +845,9 @@ def read_schedule_for_report():
             if data["status"] not in ["Pending", "Notice Sent"]:
                 continue
             try:
-                start_date = datetime.strptime(data["planned_start"], "%d.%m.%Y").date()
+                start_date = parse_flexible_date(data["planned_start"])
+                if not start_date:
+                    continue
             except:
                 continue
             days_until = (start_date - today).days
@@ -2600,7 +2686,9 @@ def build_schedule_notice_html(body_text, programme_ref, activity, responsible_l
 
 def tier_days_until(planned_start_str):
     try:
-        start_date = datetime.strptime(planned_start_str, "%d.%m.%Y").date()
+        start_date = parse_flexible_date(planned_start_str)
+        if not start_date:
+            return 0
         return max((start_date - baku_now().date()).days, 0)
     except:
         return 0
@@ -3104,7 +3192,9 @@ def check_schedule_milestone_reminders():
                 if data["status"] not in ["Pending", "Notice Sent"]:
                     continue
                 try:
-                    start_date = datetime.strptime(data["planned_start"], "%d.%m.%Y").date()
+                    start_date = parse_flexible_date(data["planned_start"])
+                    if not start_date:
+                        continue
                 except:
                     continue
 
@@ -3836,6 +3926,7 @@ def send_morning_report():
 def main():
     logger.info("Alex Email Service starting")
     load_processed_ids()
+    normalize_existing_schedule_dates()
 
     schedule.every(10).minutes.do(process_emails)
     schedule.every().day.at("05:00").do(send_morning_report)
