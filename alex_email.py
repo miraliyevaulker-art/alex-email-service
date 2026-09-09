@@ -2417,9 +2417,13 @@ def process_ncr_email(sender, subject, body, attachments, all_thread_with_names,
 
 def process_schedule_email(sender, subject, body, attachments, all_thread_with_names, msg_id_hdr):
     schedule_content = body
+    total_attachment_chars = 0
+    attachment_names = []
     if attachments:
         for att in attachments:
             schedule_content += f"\n\n{att['name']}:\n{att['content']}"
+            total_attachment_chars += len(att.get("content", "").strip())
+            attachment_names.append(att.get("name", "attachment"))
     extracted = extract_schedule_milestones(schedule_content, all_thread_with_names, subject)
     programme_ref = extracted.get("programme_reference", subject)
     milestones = extracted.get("milestones", [])
@@ -2428,7 +2432,23 @@ def process_schedule_email(sender, subject, body, attachments, all_thread_with_n
     client_emails = [p["email"] for p in clients]
 
     if not milestones:
+        # Previously this returned silently with no reply to the sender at
+        # all — meaning a schedule PDF that yields zero extracted
+        # milestones (most commonly because it's a scanned/image-based PDF
+        # or a Gantt export with no embedded text layer, so PyMuPDF pulls
+        # little to no readable text) looked exactly like Alex ignoring
+        # the email entirely, with no error and no visible cause. Now Alex
+        # always confirms receipt and explains what likely went wrong.
         save_to_monitoring(sender, subject, "Schedule received — no dated milestones extracted", "Review schedule manually", msg_id_hdr, "Monitoring")
+        diagnostic = ""
+        if not attachments:
+            diagnostic = "No attachment was found on this email. Please resend with the work programme document (PDF, Excel, or Word) attached."
+        elif total_attachment_chars < 200:
+            diagnostic = f"The attached file(s) ({', '.join(attachment_names)}) contained very little readable text. This commonly happens with scanned or image-based PDFs, or Gantt chart exports where the schedule data is rendered as an image rather than embedded text. Please try exporting the programme as a text-based PDF or Excel file, or attach it in a format with a proper data table."
+        else:
+            diagnostic = "I was unable to identify any milestones with a clear planned start date in the document provided. Please confirm the document contains a dated schedule, or forward the specific pages/table with the milestone dates."
+        notice = f"Dear {get_first_name(sender)},\n\nThank you for the work programme submission. I have reviewed the document but was unable to extract any milestones with a specific planned start date.\n\n{diagnostic}\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
+        send_email([sender], f"Re: {subject}", notice, html_body=build_reply_html(notice), reply_to_msg_id=msg_id_hdr, references=msg_id_hdr)
         return
 
     unknown_count = sum(1 for m in milestones if m.get("responsible_email", "UNKNOWN") == "UNKNOWN")
