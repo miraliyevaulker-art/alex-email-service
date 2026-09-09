@@ -94,6 +94,13 @@ REPORT_RECIPIENTS = [
     "techoffice@scopeconsulting.az"
 ]
 
+# Schedule Tracker workflow includes an additional team member (Bahruz
+# Azizov) alongside the standard REPORT_RECIPIENTS, without affecting
+# MOM, NCR, or the Daily Report — used specifically for schedule/work
+# programme confirmations, contact-update notices, and milestone
+# advance/final notice approval requests.
+SCHEDULE_REPORT_RECIPIENTS = REPORT_RECIPIENTS + ["bahruz.azizov@scopeconsulting.az"]
+
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -1943,7 +1950,7 @@ internal@scope-iq.io"""
     response = anthropic_client.messages.create(model=MODEL, max_tokens=700, system=SYSTEM_PROMPT, messages=[{"role": "user", "content": prompt}])
     draft = response.content[0].text
 
-    cc_list = list(set(schedule_data["all_participants"] + REPORT_RECIPIENTS))
+    cc_list = list(set(schedule_data["all_participants"] + SCHEDULE_REPORT_RECIPIENTS))
     cc_list = [c for c in cc_list if c.lower() != schedule_data["email"].lower() and c.lower() != ZOHO_EMAIL.lower()]
 
     notice_html = build_schedule_notice_html(draft, schedule_data["programme_ref"], schedule_data["activity"], resp_label, role, schedule_data["planned_start"], tone_label, days_until)
@@ -2072,7 +2079,7 @@ def handle_schedule_thread_reply(sender, body, schedule_matches, msg_id_hdr, ref
         return False
     new_refs = f"{references} {msg_id_hdr}".strip() if references else msg_id_hdr
     all_client_emails = list(set(e for s in schedule_matches for e in s.get("client_emails", [])))
-    cc = list(set([r for r in REPORT_RECIPIENTS if r.lower() != sender.lower()] + all_client_emails))
+    cc = list(set([r for r in SCHEDULE_REPORT_RECIPIENTS if r.lower() != sender.lower()] + all_client_emails))
     programme_ref = schedule_matches[0]["programme_ref"]
 
     if is_approval_reply(body) and not is_rejection_reply(body):
@@ -2439,7 +2446,7 @@ def process_schedule_email(sender, subject, body, attachments, all_thread_with_n
         notification += f"\n{unknown_count} milestone(s) could not be confidently matched to a responsible contact. Should you provide the relevant contractor or vendor details, I will apply them across all corresponding milestones accordingly.\n"
     notification += "\nAdvance notices will be issued to the responsible party seven days and three days ahead of each milestone's planned start date — two notices per milestone only — each subject to your prior approval before dispatch. Kindly confirm if the above is correct, or advise of any corrections required.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
 
-    cc = list(set([r for r in REPORT_RECIPIENTS if r.lower() != sender.lower()] + client_emails))
+    cc = list(set([r for r in SCHEDULE_REPORT_RECIPIENTS if r.lower() != sender.lower()] + client_emails))
     send_email([sender], f"Work Programme Logged — {programme_ref}", notification, html_body=build_reply_html(notification), cc_emails=cc, reply_to_msg_id=msg_id_hdr, references=msg_id_hdr)
 
 
@@ -3277,7 +3284,7 @@ internal@scope-iq.io"""
                 draft = response.content[0].text
 
                 approval = f"Dear Team,\n\nThe following milestone is due to start in {days_until} day(s) per the agreed work programme.\n\nProgramme reference: {data['programme_ref']}\nActivity: {data['activity']}\nResponsible: {resp_label} ({data['email']})\nPlanned start: {data['planned_start']}\n\nI have prepared a {tone_label.lower()} for your approval. Note: this is notice {tier_due} of 2 for this milestone — no further automatic notices will follow.\n\n{'='*50}\nDRAFT — {tone_label.upper()} TO {resp_label.upper()}:\n{'='*50}\n\n{draft}\n\n{'='*50}\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
-                cc = [r for r in REPORT_RECIPIENTS if r.lower() != data["uploaded_by"].lower()]
+                cc = [r for r in SCHEDULE_REPORT_RECIPIENTS if r.lower() != data["uploaded_by"].lower()]
                 sent = send_email([data["uploaded_by"]], f"Approval Required — {tone_label} — {data['activity'][:50]}", approval, html_body=build_reply_html(approval), cc_emails=cc, reply_to_msg_id=data["thread_id"], references=data["thread_id"])
                 if sent:
                     update_schedule_row(i, status="Draft Pending", last_reminded=baku_now().strftime("%d.%m.%Y %H:%M"))
