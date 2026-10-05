@@ -3405,7 +3405,7 @@ def check_followup_reminders():
                 if days_open >= AUTO_CLOSE_DAYS:
                     update_row(i, status="Closed — No Response")
                     notice = f"Dear Team,\n\nThe following email thread has been automatically closed after {AUTO_CLOSE_DAYS} days.\n\nSubject: {subject}\nFrom: {sender}\nDays open: {days_open}\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
-                    send_email(REPORT_RECIPIENTS, f"Auto-Closed — {subject}", notice, html_body=build_reply_html(notice))
+                    send_email(REPORT_RECIPIENTS, f"Auto-Closed — {subject}", notice, html_body=build_reply_html(notice, tag="Auto-Closed", tag_color="#8f8d84"))
                     continue
                 reminder_due = None
                 if days_open >= REMINDER_3_DAYS and reminder_count < 3:
@@ -3428,15 +3428,18 @@ def check_followup_reminders():
                     subject_line = f"Follow-up — {subject}"
                     body = f"Dear {first_name},\n\nI am writing to follow up on the email below, open for {days_open} days.\n\nSubject: {subject}\nDate raised: {date_str}\n\nSummary:\n{summary}\n\nAction required:\n{action}\n\nPlease review and respond at your earliest convenience.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
                     cc = [ALWAYS_CC] if sender.lower() != ALWAYS_CC.lower() else []
+                    tag, tag_color = "Follow-up", "#c98a3a"
                 elif reminder_due == 2:
                     subject_line = f"Second Follow-up — {subject}"
                     body = f"Dear {first_name},\n\nSecond follow-up. This matter has been open for {days_open} days without a response.\n\nSubject: {subject}\nDate raised: {date_str}\n\nSummary:\n{summary}\n\nAction required:\n{action}\n\nThis requires your urgent attention.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
                     cc = [ALWAYS_CC] if sender.lower() != ALWAYS_CC.lower() else []
+                    tag, tag_color = "Second Follow-up", "#d4701f"
                 elif reminder_due == 3:
                     subject_line = f"Escalation Notice — {subject}"
                     body = f"Dear {first_name},\n\nFormal escalation. This matter has been open for {days_open} days despite two previous reminders.\n\nSubject: {subject}\nDate raised: {date_str}\n\nSummary:\n{summary}\n\nAction required:\n{action}\n\nIf no response within 7 days this will be auto-closed. Copied to management.\n\nKind regards,\n\nAlex Rivera\nConstruction Expert\nSCOPE Consulting MMC\ninternal@scope-iq.io"
                     cc = [r for r in REPORT_RECIPIENTS if r.lower() != sender.lower()]
-                sent = send_email([sender], subject_line, body, cc_emails=cc, html_body=build_reply_html(body))
+                    tag, tag_color = "Escalation Notice", "#c94b4b"
+                sent = send_email([sender], subject_line, body, cc_emails=cc, html_body=build_reply_html(body, tag=tag, tag_color=tag_color))
                 if sent:
                     update_row(i, last_reminded=baku_now().strftime("%d.%m.%Y %H:%M"), reminder_count=reminder_due)
             except Exception as e:
@@ -3645,7 +3648,17 @@ Write complete formal professional reply. If files needed and never provided, re
         return None
 
 
-def build_reply_html(body_text):
+def build_reply_html(body_text, tag=None, tag_color=None):
+    """
+    General-purpose reply template, used for monitoring follow-ups,
+    generic analysis replies, and confirmation notices across MOM/NCR/
+    Schedule threads. Table-based layout throughout (not flexbox) so it
+    renders identically across every email client and mobile app, not
+    just in a browser preview. Optional tag/tag_color renders a small
+    colored urgency badge in the header — used by check_followup_reminders
+    to visually distinguish Follow-up (amber) from Second Follow-up
+    (orange) from Escalation Notice (red) at a glance.
+    """
     today = baku_now().strftime("%d %B %Y")
     time_now = baku_now().strftime("%H:%M")
     paragraphs = body_text.strip().split("\n\n")
@@ -3662,31 +3675,45 @@ def build_reply_html(body_text):
                 if not line:
                     continue
                 if "Alex Rivera" in line:
-                    sig_html += f'<div style="font-size:13px;font-weight:600;color:#1a2942;">{line}</div>'
+                    sig_html += f'<div style="font-size:13px;font-weight:700;color:#1a2942;">{line}</div>'
                 elif "internal@scope-iq.io" in line:
-                    sig_html += f'<div style="font-size:12px;color:#3CB496;">{line}</div>'
+                    sig_html += f'<div style="font-size:12px;color:#4fc3a1;">{line}</div>'
                 else:
-                    sig_html += f'<div style="font-size:12px;color:#666;">{line}</div>'
-            html_body += f'<div style="margin-top:24px;padding-top:16px;border-top:1px solid #f0f0f0;line-height:1.8;">{sig_html}</div>'
+                    sig_html += f'<div style="font-size:12px;color:#8a8880;">{line}</div>'
+            html_body += f'<div style="margin-top:22px;padding-top:16px;border-top:1px solid #ece9e2;line-height:1.8;">{sig_html}</div>'
         else:
             lines = para.split("\n")
             para_html = "<br>".join(line.strip() for line in lines if line.strip())
-            html_body += f'<p style="font-size:14px;color:#333;line-height:1.8;margin:0 0 16px;">{para_html}</p>'
-    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"></head>
-<body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif;">
-<div style="max-width:620px;margin:0 auto;padding:20px 0;">
-  <div style="background:#1a2942;border-radius:12px 12px 0 0;padding:18px 28px;">
-    <div style="display:flex;justify-content:space-between;align-items:center;">
-      <div style="color:#fff;font-size:20px;font-weight:600;letter-spacing:1px;">SCOPE <span style="color:#3CB496;">IQ</span></div>
-      <div style="font-size:11px;color:#8facc8;">{today} &nbsp;·&nbsp; {time_now} Baku</div>
-    </div>
-    <div style="font-size:12px;color:#8facc8;margin-top:6px;">Response from Alex Rivera &nbsp;·&nbsp; Construction Expert</div>
-  </div>
-  <div style="background:#fff;border:1px solid #e8e8e8;border-top:none;border-radius:0 0 12px 12px;padding:28px 28px 24px;">
+            html_body += f'<p style="font-size:14px;color:#3a3935;line-height:1.75;margin:0 0 16px;">{para_html}</p>'
+
+    badge_html = ""
+    if tag:
+        bc = tag_color or "#4fc3a1"
+        badge_html = f'<td align="right" valign="top"><span style="background:{bc};color:#fff;font-size:10px;font-weight:600;letter-spacing:0.4px;padding:4px 11px;border-radius:20px;">{tag.upper()}</span></td>'
+
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f6f6f4;font-family:Arial,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f6f6f4;">
+<tr><td align="center">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;width:100%;margin:20px 0;">
+
+<tr><td style="background:#182338;border-radius:14px 14px 0 0;padding:22px 28px;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+    <td align="left" valign="top" style="color:#fff;font-size:19px;font-weight:700;letter-spacing:0.3px;">SCOPE <span style="color:#4fc3a1;font-weight:400;">IQ</span></td>
+    {badge_html}
+  </tr></table>
+  <div style="color:#c3d0e3;font-size:12px;margin-top:8px;">{today} &nbsp;·&nbsp; {time_now} Baku &nbsp;·&nbsp; Alex Rivera, Construction Expert</div>
+</td></tr>
+
+<tr><td style="background:#ffffff;border-radius:0 0 14px 14px;padding:26px 28px 24px;">
     {html_body}
-    <div style="background:#f8f9fa;border-radius:6px;padding:10px 14px;margin-top:20px;"><div style="font-size:11px;color:#888;">This response was prepared by <strong style="color:#1a2942;">Alex Rivera</strong>, using <strong style="color:#3CB496;">SCOPE IQ</strong>.</div></div>
-  </div>
-</div></body></html>"""
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#faf9f6;border-radius:8px;margin-top:20px;"><tr><td style="padding:10px 14px;font-size:11px;color:#9a988f;">This response was prepared by <strong style="color:#1a2942;">Alex Rivera</strong>, using <strong style="color:#4fc3a1;">SCOPE IQ</strong>.</td></tr></table>
+</td></tr>
+
+</table>
+</td></tr>
+</table>
+</body></html>"""
 
 
 def process_emails():
